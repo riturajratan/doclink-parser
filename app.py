@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pdfplumber
+import pymupdf
 import pymupdf4llm
 from pypdf import PdfReader, PdfWriter
 
@@ -66,7 +67,9 @@ def sanitize_filename(filename: str) -> str:
     return cleaned or "upload.pdf"
 
 
-def render_page(*, markdown: str = "", error: str = "", output_name: str = "") -> bytes:
+def render_page(
+    *, markdown: str = "", error: str = "", output_name: str = "", pages_value: str = ""
+) -> bytes:
     result_block = ""
 
     if error:
@@ -340,6 +343,12 @@ def render_page(*, markdown: str = "", error: str = "", output_name: str = "") -
           <input id="password" name="password" type="password" placeholder="Only needed for locked PDFs">
         </div>
 
+        <div>
+          <label for="pages">Pages to parse (optional)</label>
+          <input id="pages" name="pages" type="text" placeholder="Examples: 1-3 or 2,5,7" value="{html.escape(pages_value)}">
+          <p class="hint">Leave empty to parse the full PDF.</p>
+        </div>
+
         <button id="submitButton" type="submit">Convert to Markdown</button>
       </form>
     </section>
@@ -396,6 +405,76 @@ def save_pdf_bytes(payload: bytes, filename: str) -> Path:
     upload_path = UPLOADS_DIR / upload_name
     upload_path.write_bytes(payload)
     return upload_path
+
+
+def parse_page_selection(selection: str, total_pages: int) -> list[int]:
+    if total_pages <= 0:
+        raise AppError("The PDF does not contain any pages.")
+
+    cleaned = selection.strip()
+    if not cleaned:
+        return list(range(1, total_pages + 1))
+
+    pages: set[int] = set()
+    for fragment in cleaned.split(","):
+        part = fragment.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = (value.strip() for value in part.split("-", 1))
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise AppError("Invalid pages value. Use formats like `1-3` or `2,5,7`.")
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                raise AppError("Invalid pages value. Range start must be less than or equal to range end.")
+            pages.update(range(start, end + 1))
+            continue
+
+        if not part.isdigit():
+            raise AppError("Invalid pages value. Use formats like `1-3` or `2,5,7`.")
+        pages.add(int(part))
+
+    if not pages:
+        raise AppError("No valid pages were selected.")
+
+    invalid_pages = [page for page in sorted(pages) if page < 1 or page > total_pages]
+    if invalid_pages:
+        raise AppError(
+            f"Selected pages are out of range. This PDF has {total_pages} pages."
+        )
+
+    return sorted(pages)
+
+
+def select_pdf_pages(pdf_path: Path, selection: str) -> tuple[Path, list[int], int]:
+    reader = PdfReader(str(pdf_path))
+    total_pages = len(reader.pages)
+    selected_pages = parse_page_selection(selection, total_pages)
+
+    if len(selected_pages) == total_pages:
+        return pdf_path, selected_pages, total_pages
+
+    subset_path = pdf_path.with_name(f"{pdf_path.stem}_pages_{uuid4().hex[:8]}.pdf")
+    writer = PdfWriter()
+
+    for page_number in selected_pages:
+        writer.add_page(reader.pages[page_number - 1])
+
+    if reader.metadata:
+        metadata = {
+            key: str(value)
+            for key, value in reader.metadata.items()
+            if key and value is not None
+        }
+        if metadata:
+            writer.add_metadata(metadata)
+
+    with subset_path.open("wb") as handle:
+        writer.write(handle)
+
+    return subset_path, selected_pages, total_pages
 
 
 def parse_multipart_form(
@@ -464,11 +543,14 @@ def unlock_pdf_if_needed(source_path: Path, password: str) -> Path:
 def normalize_extracted_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("©", "'")
+    text = text.replace("Á", "Rs ")
     text = re.sub(r"(?<![A-Za-z0-9])C\s*(?=\d[\d,]*\.\d{2}\b)", "Rs ", text)
     lines: list[str] = []
     previous_blank = False
 
     for raw_line in text.splitlines():
+        raw_line = re.sub(r"\(cid:\d+\)", " ", raw_line)
+        raw_line = "".join(ch for ch in raw_line if ch == "\t" or ch == "\n" or ord(ch) >= 32)
         line = re.sub(r"[ \t]+", " ", raw_line).strip()
         if line.startswith("l "):
             line = f"- {line[2:].strip()}"
@@ -482,6 +564,518 @@ def normalize_extracted_text(text: str) -> str:
         previous_blank = False
 
     return "\n".join(lines).strip()
+
+
+def normalize_text_lines(text: str) -> list[str]:
+    normalized = normalize_extracted_text(text)
+    return [line for line in normalized.splitlines() if line]
+
+
+def is_noise_line(line: str) -> bool:
+    if not line:
+        return False
+    if "(cid:" in line:
+        return True
+    weird_chars = sum(1 for ch in line if ord(ch) < 32 or ord(ch) > 126)
+    if weird_chars > 0 and weird_chars / max(len(line), 1) > 0.15:
+        return True
+    return False
+
+
+def is_useful_ocr_line(line: str) -> bool:
+    if not line or is_noise_line(line):
+        return False
+    if len(line) < 3 or len(line) > 220:
+        return False
+    if not re.search(r"[A-Za-z0-9]", line):
+        return False
+    weird_chars = sum(1 for ch in line if ord(ch) > 126)
+    if weird_chars / max(len(line), 1) > 0.1:
+        return False
+    return True
+
+
+def has_significant_image_blocks(page: pymupdf.Page) -> bool:
+    page_area = page.rect.width * page.rect.height
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 1:
+            continue
+        x0, y0, x1, y1 = block["bbox"]
+        block_area = max(x1 - x0, 0) * max(y1 - y0, 0)
+        if page_area <= 0:
+            continue
+        area_ratio = block_area / page_area
+        if area_ratio >= 0.015 or ((y1 - y0) >= 70 and y0 < page.rect.height * 0.45):
+            return True
+    return False
+
+
+def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool = True) -> str:
+    blocks = page.get_text("blocks", sort=True)
+    block_texts: list[str] = []
+
+    for block in blocks:
+        if len(block) < 5:
+            continue
+        raw_text = str(block[4] or "")
+        lines = [line for line in normalize_text_lines(raw_text) if not is_noise_line(line)]
+        if not lines:
+            continue
+        block_texts.append("\n".join(lines))
+
+    base_text = "\n\n".join(block_texts).strip()
+    if not include_selective_ocr or not has_significant_image_blocks(page):
+        return base_text
+
+    try:
+        ocr_textpage = page.get_textpage_ocr(flags=0, language="eng", dpi=150, full=False)
+        ocr_text = page.get_text("text", textpage=ocr_textpage)
+    except Exception:
+        return base_text
+
+    existing = {line.casefold() for line in normalize_text_lines(base_text)}
+    supplement_lines: list[str] = []
+    for line in normalize_text_lines(ocr_text):
+        if not is_useful_ocr_line(line):
+            continue
+        folded = line.casefold()
+        if folded in existing:
+            continue
+        if any(folded in prior.casefold() or prior.casefold() in folded for prior in supplement_lines):
+            continue
+        supplement_lines.append(line)
+        if len(supplement_lines) >= 12:
+            break
+
+    if not supplement_lines:
+        return base_text
+
+    supplement = "### OCR Supplement\n\n" + "\n".join(supplement_lines)
+    return "\n\n".join(part for part in [base_text, supplement] if part).strip()
+
+
+def looks_like_account_marker(line: str) -> bool:
+    return bool(re.fullmatch(r"\d{4,}X{2,}\d{2,}", line))
+
+
+def looks_like_transaction_header(line: str) -> bool:
+    lowered = line.lower()
+    return "date" in lowered and "transaction" in lowered and "amount" in lowered
+
+
+def looks_like_transaction_header_window(lines: list[str], start: int) -> bool:
+    window = " ".join(line.lower() for line in lines[start : start + 8] if line)
+    if not window:
+        return False
+
+    return (
+        "date" in window
+        and "transaction" in window
+        and "amount" in window
+        and ("serno" in window or "description" in window or "reward" in window)
+    )
+
+
+def looks_like_datetime_transaction_header_window(lines: list[str], start: int) -> bool:
+    window = " ".join(line.lower() for line in lines[start : start + 8] if line)
+    local_window = " ".join(line.lower() for line in lines[start : start + 3] if line)
+    if not window:
+        return False
+
+    return (
+        "date" in local_window
+        and ("time" in local_window or "& time" in local_window)
+        and "transaction" in window
+        and "amount" in window
+    )
+
+
+def parse_statement_transaction_row(line: str) -> list[str] | None:
+    tokens = line.split()
+    if len(tokens) < 4:
+        return None
+    if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", tokens[0]):
+        return None
+
+    index = 1
+    ser_no = ""
+    if index < len(tokens) and re.fullmatch(r"\d{8,}", tokens[index]):
+        ser_no = tokens[index]
+        index += 1
+
+    tail_index = len(tokens)
+    amount = ""
+    if tail_index >= 2 and tokens[-1] in {"CR", "DR"} and re.fullmatch(r"[\d,]+\.\d{2}", tokens[-2]):
+        amount = f"{tokens[-2]} {tokens[-1]}"
+        tail_index -= 2
+    elif re.fullmatch(r"[\d,]+\.\d{2}", tokens[-1]):
+        amount = tokens[-1]
+        tail_index -= 1
+    else:
+        return None
+
+    reward = ""
+    if tail_index - 1 >= index and re.fullmatch(r"\d+", tokens[tail_index - 1]):
+        reward = tokens[tail_index - 1]
+        tail_index -= 1
+
+    description = " ".join(tokens[index:tail_index]).strip()
+    if not description:
+        return None
+
+    amount = amount.replace("Á", "Rs ")
+    if not amount.startswith("Rs "):
+        amount = f"Rs {amount}"
+
+    return [tokens[0], ser_no, description, reward, amount]
+
+
+def is_amount_token(value: str) -> bool:
+    normalized = value.replace("`", "Rs ").replace("Á", "Rs ").strip()
+    normalized = re.sub(r"^[+-]\s*", "", normalized)
+    parts = normalized.split()
+    if len(parts) == 2 and parts[1] in {"CR", "DR"}:
+        return bool(re.fullmatch(r"(?:Rs\s+)?[\d,]+\.\d{2}", parts[0]))
+    return bool(re.fullmatch(r"(?:Rs\s+)?[\d,]+\.\d{2}", normalized))
+
+
+def normalize_amount_token(value: str) -> str:
+    normalized = value.replace("`", "Rs ").replace("Á", "Rs ").strip()
+    prefix = ""
+    if normalized.startswith("+"):
+        prefix = "+ "
+        normalized = normalized[1:].strip()
+    elif normalized.startswith("-"):
+        prefix = "- "
+        normalized = normalized[1:].strip()
+
+    if not normalized.startswith("Rs "):
+        normalized = f"Rs {normalized}"
+    normalized = prefix + normalized
+    return normalized
+
+
+def parse_statement_transaction_row_multiline(
+    lines: list[str], start_index: int
+) -> tuple[list[str], int] | None:
+    if start_index + 2 >= len(lines):
+        return None
+    if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", lines[start_index]):
+        return None
+    if not re.fullmatch(r"\d{8,}", lines[start_index + 1]):
+        return None
+
+    index = start_index + 2
+    description_lines: list[str] = []
+
+    while index < len(lines):
+        current = lines[index]
+        if not current:
+            index += 1
+            continue
+        if looks_like_account_marker(current):
+            break
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", current):
+            break
+        if re.fullmatch(r"\d+", current) and index + 1 < len(lines) and is_amount_token(lines[index + 1]):
+            break
+        if is_amount_token(current):
+            break
+        description_lines.append(current)
+        index += 1
+
+    if not description_lines or index >= len(lines):
+        return None
+
+    reward = ""
+    if re.fullmatch(r"\d+", lines[index]):
+        reward = lines[index]
+        index += 1
+
+    if index >= len(lines) or not is_amount_token(lines[index]):
+        return None
+
+    amount = normalize_amount_token(lines[index])
+    row = [
+        lines[start_index],
+        lines[start_index + 1],
+        " ".join(description_lines).strip(),
+        reward,
+        amount,
+    ]
+    return row, index + 1
+
+
+def parse_datetime_transaction_row_multiline(
+    lines: list[str], start_index: int
+) -> tuple[list[str], int] | None:
+    if start_index >= len(lines):
+        return None
+
+    match = re.fullmatch(r"(\d{2}/\d{2}/\d{4})\|\s*(\d{2}:\d{2})", lines[start_index])
+    if not match:
+        return None
+
+    index = start_index + 1
+    description_lines: list[str] = []
+
+    while index < len(lines):
+        current = lines[index]
+        if not current:
+            index += 1
+            continue
+        if re.fullmatch(r"(\d{2}/\d{2}/\d{4})\|\s*(\d{2}:\d{2})", current):
+            break
+        if is_amount_token(current):
+            break
+        description_lines.append(current)
+        index += 1
+
+    if not description_lines or index >= len(lines) or not is_amount_token(lines[index]):
+        return None
+
+    amount = normalize_amount_token(lines[index])
+    index += 1
+
+    indicator = ""
+    if index < len(lines) and lines[index] and not re.fullmatch(r"(\d{2}/\d{2}/\d{4})\|\s*(\d{2}:\d{2})", lines[index]):
+        if len(lines[index]) <= 24:
+            indicator = lines[index]
+            index += 1
+
+    tx_date, tx_time = match.groups()
+    row = [f"{tx_date} {tx_time}", " ".join(description_lines).strip(), amount, indicator]
+    return row, index
+
+
+def render_transaction_sections(
+    sections: list[tuple[str | None, list[list[str]]]], heading: str = "### Transactions"
+) -> list[str]:
+    if not sections:
+        return []
+
+    lines = [heading, ""]
+    for section_index, (account, account_rows) in enumerate(sections):
+        if section_index > 0:
+            lines.append("")
+        if account:
+            lines.append(f"Account: {account}")
+            lines.append("")
+        lines.extend(
+            render_markdown_table(
+                ["Date", "SerNo.", "Transaction Details", "Reward", "Amount"],
+                account_rows,
+            )
+        )
+
+    return lines
+
+
+def extract_transaction_sections_from_text(text: str) -> list[str]:
+    lines = [line for line in text.splitlines() if not is_noise_line(line)]
+    output: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        header_index = index
+        if not looks_like_transaction_header_window(lines, index):
+            index += 1
+            continue
+
+        while index < len(lines):
+            current = lines[index]
+            lowered = current.lower()
+            parsed_row = parse_statement_transaction_row(current)
+            if looks_like_account_marker(current) or parsed_row is not None:
+                break
+            if any(
+                token in lowered
+                for token in ("date", "serno", "transaction", "reward", "points", "intl", "amount")
+            ):
+                index += 1
+                continue
+            break
+
+        sections: list[tuple[str | None, list[list[str]]]] = []
+        current_account: str | None = None
+        rows: list[list[str]] = []
+
+        while index < len(lines):
+            current = lines[index]
+            if not current:
+                index += 1
+                continue
+            if looks_like_account_marker(current):
+                if rows:
+                    sections.append((current_account, rows))
+                    rows = []
+                current_account = current
+                index += 1
+                continue
+
+            parsed_row = parse_statement_transaction_row(current)
+            if parsed_row is not None:
+                rows.append(parsed_row)
+                index += 1
+                continue
+
+            parsed_multiline = parse_statement_transaction_row_multiline(lines, index)
+            if parsed_multiline is not None:
+                row, next_index = parsed_multiline
+                rows.append(row)
+                index = next_index
+                continue
+
+            break
+
+        if rows:
+            sections.append((current_account, rows))
+
+        if sections:
+            return render_transaction_sections(sections)
+
+        index = header_index + 1
+
+    return output
+
+
+def extract_datetime_transaction_sections_from_text(text: str) -> list[str]:
+    lines = [line for line in text.splitlines() if not is_noise_line(line)]
+    index = 0
+
+    while index < len(lines):
+        header_index = index
+        if not looks_like_datetime_transaction_header_window(lines, index):
+            index += 1
+            continue
+
+        skipped_context = 0
+        while index < len(lines):
+            current = lines[index]
+            lowered = current.lower()
+            if re.fullmatch(r"(\d{2}/\d{2}/\d{4})\|\s*(\d{2}:\d{2})", current):
+                break
+            if any(token in lowered for token in ("date", "time", "transaction", "amount", "description", "pi")):
+                index += 1
+                continue
+            if skipped_context < 6:
+                skipped_context += 1
+                index += 1
+                continue
+            break
+
+        rows: list[list[str]] = []
+        while index < len(lines):
+            parsed = parse_datetime_transaction_row_multiline(lines, index)
+            if parsed is None:
+                break
+            row, next_index = parsed
+            rows.append(row)
+            index = next_index
+
+        if rows:
+            return [
+                "### Transactions",
+                "",
+                *render_markdown_table(
+                    ["Date & Time", "Transaction Description", "Amount", "PI"],
+                    rows,
+                ),
+            ]
+
+        index = header_index + 1
+
+    return []
+
+
+def skip_statement_transaction_block(lines: list[str], index: int) -> int:
+    index += 1
+    while index < len(lines):
+        current = lines[index]
+        lowered = current.lower()
+        if not current:
+            index += 1
+            continue
+        parsed_multiline = parse_statement_transaction_row_multiline(lines, index)
+        if parsed_multiline is not None:
+            _, next_index = parsed_multiline
+            index = next_index
+            continue
+        if looks_like_account_marker(current) or parse_statement_transaction_row(current) is not None:
+            index += 1
+            continue
+        if any(
+            token in lowered
+            for token in ("date", "serno", "transaction", "reward", "points", "intl", "amount")
+        ):
+            index += 1
+            continue
+        break
+    return index
+
+
+def skip_datetime_transaction_block(lines: list[str], index: int) -> int:
+    index += 1
+    while index < len(lines):
+        current = lines[index]
+        lowered = current.lower()
+        if not current:
+            index += 1
+            continue
+        if index + 1 < len(lines) and parse_datetime_transaction_row_multiline(lines, index + 1) is not None:
+            index += 1
+            continue
+        parsed = parse_datetime_transaction_row_multiline(lines, index)
+        if parsed is not None:
+            _, next_index = parsed
+            index = next_index
+            continue
+        if any(token in lowered for token in ("date", "time", "transaction", "amount", "description", "pi")):
+            index += 1
+            continue
+        break
+    return index
+
+
+def format_generic_text_page(text: str) -> str:
+    lines = [line for line in text.splitlines() if not is_noise_line(line)]
+    output: list[str] = []
+    index = 0
+    emitted_transactions = False
+
+    while index < len(lines):
+        line = lines[index]
+
+        if emitted_transactions and looks_like_transaction_header_window(lines, index):
+            index = skip_statement_transaction_block(lines, index)
+            continue
+
+        if emitted_transactions and looks_like_datetime_transaction_header_window(lines, index):
+            index = skip_datetime_transaction_block(lines, index)
+            continue
+
+        if not emitted_transactions and looks_like_transaction_header_window(lines, index):
+            transaction_lines = extract_transaction_sections_from_text("\n".join(lines[index:]))
+            if transaction_lines:
+                output.extend(transaction_lines)
+                output.append("")
+                emitted_transactions = True
+                index = skip_statement_transaction_block(lines, index)
+                continue
+
+        if not emitted_transactions and looks_like_datetime_transaction_header_window(lines, index):
+            transaction_lines = extract_datetime_transaction_sections_from_text("\n".join(lines[index:]))
+            if transaction_lines:
+                output.extend(transaction_lines)
+                output.append("")
+                emitted_transactions = True
+                index = skip_datetime_transaction_block(lines, index)
+                continue
+
+        output.append(line)
+        index += 1
+
+    return "\n".join(output).strip()
 
 
 def escape_markdown_cell(value: str) -> str:
@@ -715,6 +1309,63 @@ def extract_page_tables(pdf_path: Path) -> list[list[list[Any]]]:
     return tables_by_page
 
 
+def extract_selected_page_texts(pdf_path: Path, page_numbers: list[int]) -> dict[int, str]:
+    if not page_numbers:
+        return {}
+
+    document = pymupdf.open(str(pdf_path))
+    page_texts: dict[int, str] = {}
+
+    for page_number in sorted(set(page_numbers)):
+        if 1 <= page_number <= document.page_count:
+            page_texts[page_number] = normalize_extracted_text(
+                document[page_number - 1].get_text("text") or ""
+            )
+
+    return page_texts
+
+
+def has_markdown_table(markdown: str) -> bool:
+    return "| ---" in markdown
+
+
+def page_needs_canonical_transactions(markdown: str) -> bool:
+    lowered = markdown.lower()
+    return (
+        ("transaction" in lowered and "amount" in lowered and ("serno" in lowered or "date" in lowered))
+        or bool(re.search(r"\d{4,}X{2,}\d{2,}", markdown))
+    )
+
+
+def build_canonical_page_sections(
+    page_text: str,
+    page_tables: list[list[Any]] | None,
+    base_markdown: str,
+    *,
+    include_structured_tables: bool = False,
+) -> list[str]:
+    sections: list[str] = []
+    transaction_lines = extract_transaction_sections_from_text(page_text)
+    if transaction_lines:
+        sections.append(
+            "\n".join(transaction_lines).replace("### Transactions", "### Canonical Transactions", 1)
+        )
+
+    if include_structured_tables and page_tables and not has_markdown_table(base_markdown):
+        structured_tables: list[str] = []
+        for table_index, table_rows in enumerate(page_tables, start=1):
+            table_lines = table_to_markdown(table_rows, table_index)
+            if not table_lines:
+                continue
+            if table_lines[0].startswith("### Table "):
+                table_lines[0] = table_lines[0].replace("### Table ", "### Structured Table ", 1)
+            structured_tables.append("\n".join(table_lines))
+
+        sections.extend(structured_tables)
+
+    return [section.strip() for section in sections if section.strip()]
+
+
 def clean_markdown_output(markdown: str) -> str:
     markdown = re.sub(r"^=== Document parser messages ===.*?(?=\n##|\n#|\Z)", "", markdown, flags=re.S)
     markdown = re.sub(r"\*\*==> picture .*? intentionally omitted <==\*\*\n*", "", markdown)
@@ -731,17 +1382,40 @@ def clean_markdown_output(markdown: str) -> str:
     return markdown.strip()
 
 
-def convert_with_pymupdf4llm(pdf_path: Path) -> str:
+def convert_with_pymupdf4llm(
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+    *,
+    use_ocr: bool = False,
+    force_text: bool = False,
+) -> str:
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        result = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+        result = pymupdf4llm.to_markdown(
+            str(pdf_path),
+            page_chunks=True,
+            use_ocr=use_ocr,
+            force_text=force_text,
+            show_progress=False,
+        )
 
     if isinstance(result, list):
+        chunk_texts = [clean_markdown_output(chunk.get("text", "")) for chunk in result]
+        candidate_pages = [
+            page_index
+            for page_index, text in enumerate(chunk_texts, start=1)
+            if page_needs_canonical_transactions(text)
+        ]
+        page_texts = extract_selected_page_texts(pdf_path, candidate_pages)
         page_sections: list[str] = []
-        for page_index, chunk in enumerate(result, start=1):
-            text = clean_markdown_output(chunk.get("text", ""))
+        for page_index, text in enumerate(chunk_texts, start=1):
+            page_label = page_labels[page_index - 1] if page_labels and page_index - 1 < len(page_labels) else page_index
+            page_text = page_texts.get(page_index, "")
+            if page_text:
+                canonical_sections = build_canonical_page_sections(page_text, None, text)
+                text = "\n\n".join(part for part in [text, *canonical_sections] if part)
             if not text:
                 continue
-            page_sections.append(f"## Page {page_index}\n\n{text}")
+            page_sections.append(f"## Page {page_label}\n\n{text}")
 
         if page_sections:
             title = pdf_path.stem.removesuffix("_unlocked").replace("_", " ")
@@ -750,19 +1424,25 @@ def convert_with_pymupdf4llm(pdf_path: Path) -> str:
     return clean_markdown_output(str(result))
 
 
-def extract_text_markdown(pdf_path: Path) -> tuple[str, int]:
-    reader = PdfReader(str(pdf_path))
-    tables_by_page = extract_page_tables(pdf_path)
+def extract_text_markdown(
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+    *,
+    include_tables: bool = True,
+) -> tuple[str, int]:
+    document = pymupdf.open(str(pdf_path))
+    tables_by_page = extract_page_tables(pdf_path) if include_tables else []
     page_sections: list[str] = []
     total_chars = 0
 
-    for page_index, page in enumerate(reader.pages, start=1):
-        text = normalize_extracted_text(page.extract_text() or "")
+    for page_index in range(1, document.page_count + 1):
+        page_label = page_labels[page_index - 1] if page_labels and page_index - 1 < len(page_labels) else page_index
+        text = normalize_extracted_text(document[page_index - 1].get_text("text") or "")
         total_chars += len(text)
-        page_lines: list[str] = [f"## Page {page_index}", ""]
+        page_lines: list[str] = [f"## Page {page_label}", ""]
 
         if text:
-            page_lines.append(text)
+            page_lines.append(format_generic_text_page(text))
             page_lines.append("")
 
         page_tables = tables_by_page[page_index - 1] if page_index - 1 < len(tables_by_page) else []
@@ -782,21 +1462,70 @@ def extract_text_markdown(pdf_path: Path) -> tuple[str, int]:
     return markdown, total_chars
 
 
-def convert_pdf_to_markdown(pdf_path: Path) -> tuple[str, Path]:
+def is_text_based_pdf(pdf_path: Path, sample_pages: int = 3) -> bool:
+    document = pymupdf.open(str(pdf_path))
+    chars = 0
+    checked = 0
+
+    for page_index in range(min(sample_pages, document.page_count)):
+        text = normalize_extracted_text(document[page_index].get_text("text") or "")
+        chars += len(text)
+        checked += 1
+
+    if checked == 0:
+        return False
+
+    return chars >= 500
+
+
+def convert_pdf_to_markdown(
+    pdf_path: Path, page_labels: list[int] | None = None
+) -> tuple[str, Path]:
     markdown = ""
+    text_based = False
 
     try:
-        markdown = convert_with_pymupdf4llm(pdf_path)
+        text_based = is_text_based_pdf(pdf_path)
     except Exception:
-        markdown = ""
+        text_based = False
 
-    if len(markdown.strip()) < 200:
-        markdown, total_chars = extract_text_markdown(pdf_path)
-
-        # Final fallback for image-heavy / scanned PDFs.
+    if text_based:
+        markdown, total_chars = extract_text_markdown(
+            pdf_path,
+            page_labels=page_labels,
+            include_tables=False,
+        )
         if total_chars < 400:
-            result = get_converter().convert(str(pdf_path))
-            markdown = result.document.export_to_markdown()
+            try:
+                markdown = convert_with_pymupdf4llm(
+                    pdf_path,
+                    page_labels=page_labels,
+                    use_ocr=False,
+                    force_text=False,
+                )
+            except Exception:
+                result = get_converter().convert(str(pdf_path))
+                markdown = result.document.export_to_markdown()
+    else:
+        try:
+            markdown = convert_with_pymupdf4llm(
+                pdf_path,
+                page_labels=page_labels,
+                use_ocr=True,
+                force_text=True,
+            )
+        except Exception:
+            markdown = ""
+
+        if len(markdown.strip()) < 200:
+            markdown, total_chars = extract_text_markdown(
+                pdf_path,
+                page_labels=page_labels,
+                include_tables=True,
+            )
+            if total_chars < 400:
+                result = get_converter().convert(str(pdf_path))
+                markdown = result.document.export_to_markdown()
 
     output_name = f"{pdf_path.stem}.md"
     output_path = OUTPUTS_DIR / output_name
@@ -843,33 +1572,47 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
             filename, payload = pdf_file
             password = fields.get("password", "").strip()
+            pages_value = fields.get("pages", "").strip()
             saved_pdf = save_pdf_bytes(payload, filename)
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
-            markdown, output_path = convert_pdf_to_markdown(ready_pdf)
+            parse_pdf, selected_pages, _ = select_pdf_pages(ready_pdf, pages_value)
+            markdown, output_path = convert_pdf_to_markdown(parse_pdf, page_labels=selected_pages)
             self.respond_html(
-                render_page(markdown=markdown, output_name=output_path.name)
+                render_page(
+                    markdown=markdown,
+                    output_name=output_path.name,
+                    pages_value=pages_value,
+                )
             )
         except AppError as exc:
-            self.respond_html(render_page(error=str(exc)), status=HTTPStatus.BAD_REQUEST)
+            self.respond_html(
+                render_page(error=str(exc), pages_value=fields.get("pages", "").strip() if "fields" in locals() else ""),
+                status=HTTPStatus.BAD_REQUEST,
+            )
         except Exception as exc:  # pragma: no cover - local server guardrail
             self.respond_html(
-                render_page(error=f"Unexpected error: {exc}"),
+                render_page(
+                    error=f"Unexpected error: {exc}",
+                    pages_value=fields.get("pages", "").strip() if "fields" in locals() else "",
+                ),
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
     def handle_api_convert(self) -> None:
         try:
-            saved_pdf, password, original_filename = self.parse_api_input()
+            saved_pdf, password, original_filename, pages_value = self.parse_api_input()
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
-            markdown, output_path = convert_pdf_to_markdown(ready_pdf)
-            page_count = len(PdfReader(str(ready_pdf)).pages)
+            parse_pdf, selected_pages, total_pages = select_pdf_pages(ready_pdf, pages_value)
+            markdown, output_path = convert_pdf_to_markdown(parse_pdf, page_labels=selected_pages)
             self.respond_json(
                 {
                     "success": True,
                     "filename": original_filename,
-                    "stored_filename": ready_pdf.name,
+                    "stored_filename": parse_pdf.name,
                     "output_filename": output_path.name,
-                    "page_count": page_count,
+                    "page_count": len(selected_pages),
+                    "total_page_count": total_pages,
+                    "selected_pages": selected_pages,
                     "markdown": markdown,
                 }
             )
@@ -884,7 +1627,7 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def parse_api_input(self) -> tuple[Path, str, str]:
+    def parse_api_input(self) -> tuple[Path, str, str, str]:
         content_type = self.headers.get("Content-Type", "")
 
         if content_type.startswith("application/json"):
@@ -901,12 +1644,13 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
             filename = str(payload.get("filename", "upload.pdf") or "upload.pdf")
             password = str(payload.get("password", "") or "").strip()
+            pages_value = str(payload.get("pages", "") or "").strip()
             try:
                 pdf_bytes = base64.b64decode(pdf_base64, validate=True)
             except (binascii.Error, ValueError) as exc:
                 raise AppError("`pdf_base64` is not valid base64.") from exc
 
-            return save_pdf_bytes(pdf_bytes, filename), password, filename
+            return save_pdf_bytes(pdf_bytes, filename), password, filename, pages_value
 
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
@@ -918,7 +1662,8 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
         original_filename, pdf_bytes = pdf_file
         password = fields.get("password", "").strip()
-        return save_pdf_bytes(pdf_bytes, original_filename), password, original_filename
+        pages_value = fields.get("pages", "").strip()
+        return save_pdf_bytes(pdf_bytes, original_filename), password, original_filename, pages_value
 
     def handle_download(self, query_string: str) -> None:
         params = parse_qs(query_string)

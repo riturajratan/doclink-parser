@@ -1,6 +1,6 @@
 # PDF to Markdown
 
-Small local web app that uploads a PDF, optionally unlocks it with a password, converts it with Docling, and returns Markdown in the browser.
+Small local web app that uploads a PDF, optionally unlocks it with a password, converts it into Markdown, and returns the result in the browser or API.
 
 ## Run
 
@@ -26,6 +26,7 @@ python3 app.py
 - Uploaded PDFs are stored under `storage/uploads/`.
 - Generated Markdown files are stored under `storage/outputs/`.
 - If the PDF is encrypted, enter the document password in the form before converting.
+- You can limit parsing to specific pages with values like `1-3` or `2,5,7`.
 - Default port is `8010`. Override it with `PORT=9000 python3 app.py` if needed.
 
 ## API
@@ -38,13 +39,15 @@ Multipart form-data fields:
 
 - `pdf`: PDF file
 - `password`: optional PDF password
+- `pages`: optional page selection like `1-3` or `2,5,7`
 
 Example:
 
 ```bash
 curl -X POST http://127.0.0.1:8010/api/convert \
   -F "pdf=@/path/to/file.pdf" \
-  -F "password=secret"
+  -F "password=secret" \
+  -F "pages=1-3"
 ```
 
 JSON body is also supported:
@@ -53,6 +56,7 @@ JSON body is also supported:
 {
   "filename": "file.pdf",
   "password": "secret",
+  "pages": "1-3",
   "pdf_base64": "BASE64_ENCODED_PDF"
 }
 ```
