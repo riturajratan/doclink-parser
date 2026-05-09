@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
-import cgi
 import contextlib
+import email.policy
 import html
 import io
 import json
@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import tempfile
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -385,12 +386,6 @@ def render_page(*, markdown: str = "", error: str = "", output_name: str = "") -
     return page.encode("utf-8")
 
 
-def save_uploaded_pdf(file_item: cgi.FieldStorage) -> Path:
-    payload = file_item.file.read()
-    original_name = Path(file_item.filename or "upload.pdf").name
-    return save_pdf_bytes(payload, original_name)
-
-
 def save_pdf_bytes(payload: bytes, filename: str) -> Path:
     original_name = sanitize_filename(Path(filename or "upload.pdf").name)
     if not original_name.lower().endswith(".pdf"):
@@ -401,6 +396,39 @@ def save_pdf_bytes(payload: bytes, filename: str) -> Path:
     upload_path = UPLOADS_DIR / upload_name
     upload_path.write_bytes(payload)
     return upload_path
+
+
+def parse_multipart_form(
+    content_type: str, body: bytes
+) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    message = BytesParser(policy=email.policy.default).parsebytes(
+        b"Content-Type: "
+        + content_type.encode("utf-8")
+        + b"\r\nMIME-Version: 1.0\r\n\r\n"
+        + body
+    )
+
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+
+    if not message.is_multipart():
+        return fields, files
+
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+
+        if filename:
+            files[name] = (filename, payload)
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = payload.decode(charset, errors="replace")
+
+    return fields, files
 def unlock_pdf_if_needed(source_path: Path, password: str) -> Path:
     reader = PdfReader(str(source_path))
     if not reader.is_encrypted:
@@ -804,23 +832,18 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
-                },
-                keep_blank_values=True,
-            )
+            content_type = self.headers.get("Content-Type", "")
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length)
+            fields, files = parse_multipart_form(content_type, body)
 
-            file_item = form["pdf"] if "pdf" in form else None
-            if file_item is None or not getattr(file_item, "filename", ""):
+            pdf_file = files.get("pdf")
+            if pdf_file is None:
                 raise AppError("Choose a PDF file to upload.")
 
-            password = form.getfirst("password", "").strip()
-            saved_pdf = save_uploaded_pdf(file_item)
+            filename, payload = pdf_file
+            password = fields.get("password", "").strip()
+            saved_pdf = save_pdf_bytes(payload, filename)
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
             markdown, output_path = convert_pdf_to_markdown(ready_pdf)
             self.respond_html(
@@ -885,24 +908,17 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
             return save_pdf_bytes(pdf_bytes, filename), password, filename
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": content_type,
-                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
-            },
-            keep_blank_values=True,
-        )
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        fields, files = parse_multipart_form(content_type, raw_body)
 
-        file_item = form["pdf"] if "pdf" in form else None
-        if file_item is None or not getattr(file_item, "filename", ""):
+        pdf_file = files.get("pdf")
+        if pdf_file is None:
             raise AppError("Multipart form must include a `pdf` file field.")
 
-        password = form.getfirst("password", "").strip()
-        original_filename = Path(file_item.filename).name
-        return save_uploaded_pdf(file_item), password, original_filename
+        original_filename, pdf_bytes = pdf_file
+        password = fields.get("password", "").strip()
+        return save_pdf_bytes(pdf_bytes, original_filename), password, original_filename
 
     def handle_download(self, query_string: str) -> None:
         params = parse_qs(query_string)
