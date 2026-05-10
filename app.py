@@ -67,6 +67,12 @@ def sanitize_filename(filename: str) -> str:
     return cleaned or "upload.pdf"
 
 
+def markdown_title_from_filename(filename: str) -> str:
+    stem = Path(filename or "upload.pdf").stem
+    cleaned = stem.replace("_", " ").strip()
+    return cleaned or "PDF Document"
+
+
 def render_page(
     *, markdown: str = "", error: str = "", output_name: str = "", pages_value: str = ""
 ) -> bytes:
@@ -1772,6 +1778,7 @@ def convert_with_pymupdf4llm(
     *,
     use_ocr: bool = False,
     force_text: bool = False,
+    document_title: str | None = None,
 ) -> str:
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         result = pymupdf4llm.to_markdown(
@@ -1802,7 +1809,7 @@ def convert_with_pymupdf4llm(
             page_sections.append(f"## Page {page_label}\n\n{text}")
 
         if page_sections:
-            title = pdf_path.stem.removesuffix("_unlocked").replace("_", " ")
+            title = document_title or markdown_title_from_filename(pdf_path.stem.removesuffix("_unlocked"))
             return f"# {title}\n\n" + "\n\n---\n\n".join(page_sections)
 
     return clean_markdown_output(str(result))
@@ -1814,6 +1821,7 @@ def extract_text_markdown(
     *,
     include_tables: bool = True,
     include_selective_ocr: bool = True,
+    document_title: str | None = None,
 ) -> tuple[str, int]:
     document = pymupdf.open(str(pdf_path))
     tables_by_page = extract_page_tables(pdf_path) if include_tables else []
@@ -1845,8 +1853,7 @@ def extract_text_markdown(
     if not page_sections:
         return "", 0
 
-    title_stem = pdf_path.stem.removesuffix("_unlocked")
-    title = title_stem.replace("_", " ")
+    title = document_title or markdown_title_from_filename(pdf_path.stem.removesuffix("_unlocked"))
     markdown = f"# {title}\n\n" + "\n\n---\n\n".join(page_sections)
     return markdown, total_chars
 
@@ -1868,7 +1875,10 @@ def is_text_based_pdf(pdf_path: Path, sample_pages: int = 3) -> bool:
 
 
 def convert_pdf_to_markdown(
-    pdf_path: Path, page_labels: list[int] | None = None
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+    *,
+    document_title: str | None = None,
 ) -> tuple[str, Path]:
     markdown = ""
     text_based = False
@@ -1884,6 +1894,7 @@ def convert_pdf_to_markdown(
             page_labels=page_labels,
             include_tables=False,
             include_selective_ocr=False,
+            document_title=document_title,
         )
         if total_chars < 400:
             try:
@@ -1892,6 +1903,7 @@ def convert_pdf_to_markdown(
                     page_labels=page_labels,
                     use_ocr=False,
                     force_text=False,
+                    document_title=document_title,
                 )
             except Exception:
                 result = get_converter().convert(str(pdf_path))
@@ -1903,6 +1915,7 @@ def convert_pdf_to_markdown(
                 page_labels=page_labels,
                 use_ocr=True,
                 force_text=True,
+                document_title=document_title,
             )
         except Exception:
             markdown = ""
@@ -1913,6 +1926,7 @@ def convert_pdf_to_markdown(
                 page_labels=page_labels,
                 include_tables=True,
                 include_selective_ocr=True,
+                document_title=document_title,
             )
             if total_chars < 400:
                 result = get_converter().convert(str(pdf_path))
@@ -1967,7 +1981,11 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             saved_pdf = save_pdf_bytes(payload, filename)
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
             parse_pdf, selected_pages, _ = select_pdf_pages(ready_pdf, pages_value)
-            markdown, output_path = convert_pdf_to_markdown(parse_pdf, page_labels=selected_pages)
+            markdown, output_path = convert_pdf_to_markdown(
+                parse_pdf,
+                page_labels=selected_pages,
+                document_title=markdown_title_from_filename(filename),
+            )
             self.respond_html(
                 render_page(
                     markdown=markdown,
@@ -1994,7 +2012,11 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             saved_pdf, password, original_filename, pages_value = self.parse_api_input()
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
             parse_pdf, selected_pages, total_pages = select_pdf_pages(ready_pdf, pages_value)
-            markdown, output_path = convert_pdf_to_markdown(parse_pdf, page_labels=selected_pages)
+            markdown, output_path = convert_pdf_to_markdown(
+                parse_pdf,
+                page_labels=selected_pages,
+                document_title=markdown_title_from_filename(original_filename),
+            )
             self.respond_json(
                 {
                     "success": True,
