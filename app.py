@@ -571,6 +571,31 @@ def normalize_text_lines(text: str) -> list[str]:
     return [line for line in normalized.splitlines() if line]
 
 
+def looks_like_numeric_value(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.fullmatch(r"[+-=._]+", stripped):
+        return True
+    if is_amount_token(stripped):
+        return True
+    if re.fullmatch(r"[A-Z]?\d[\d,./-]*", stripped):
+        return True
+    if re.fullmatch(r"\d{1,2}\s+[A-Za-z]{3},?\s+\d{4}", stripped):
+        return True
+    return False
+
+
+def is_probable_label(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or looks_like_numeric_value(stripped):
+        return False
+    if len(stripped) > 70:
+        return False
+    letters = sum(ch.isalpha() for ch in stripped)
+    return letters >= 3
+
+
 def is_noise_line(line: str) -> bool:
     if not line:
         return False
@@ -650,8 +675,219 @@ def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool 
     if not supplement_lines:
         return base_text
 
-    supplement = "### OCR Supplement\n\n" + "\n".join(supplement_lines)
+    supplement = "\n".join(supplement_lines)
     return "\n\n".join(part for part in [base_text, supplement] if part).strip()
+
+
+def collapse_continuation_lines(lines: list[str]) -> list[str]:
+    collapsed: list[str] = []
+    for line in lines:
+        if (
+            collapsed
+            and not looks_like_numeric_value(line)
+            and (
+                line.startswith("(")
+                or line[0].islower()
+                or (
+                    len(line) <= 24
+                    and not re.search(r"\d", line)
+                    and collapsed[-1].upper() == collapsed[-1]
+                )
+            )
+        ):
+            collapsed[-1] = f"{collapsed[-1]} {line}".strip()
+            continue
+        collapsed.append(line)
+    return collapsed
+
+
+def mostly_numeric_lines(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    numeric_like = sum(1 for line in lines if looks_like_numeric_value(line))
+    return numeric_like >= max(1, len(lines) - 1)
+
+
+def mostly_label_lines(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    label_like = sum(1 for line in lines if is_probable_label(line))
+    return label_like >= max(1, len(lines) - 1)
+
+
+def collect_text_blocks(page: pymupdf.Page) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for raw_block in page.get_text("blocks", sort=True):
+        if len(raw_block) < 5:
+            continue
+        raw_text = str(raw_block[4] or "")
+        lines = [line for line in normalize_text_lines(raw_text) if not is_noise_line(line)]
+        if not lines:
+            continue
+        lines = collapse_continuation_lines(lines)
+        x0, y0, x1, y1 = raw_block[:4]
+        blocks.append(
+            {
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
+                "lines": lines,
+                "text": "\n".join(lines),
+            }
+        )
+    return blocks
+
+
+def looks_like_footer_block(block: dict[str, Any], page_height: float) -> bool:
+    text = block["text"]
+    lowered = text.lower()
+    if re.search(r"page\s+\d+\s+of\s+\d+", lowered):
+        return True
+    if "digitally" in lowered or "signed by" in lowered:
+        return True
+    if block["y0"] >= page_height * 0.9 and ("bank limited" in lowered or lowered == "useful links"):
+        return True
+    return False
+
+
+def extract_inline_pairs(lines: list[str]) -> list[tuple[str, str]]:
+    if len(lines) == 2 and is_probable_label(lines[0]) and looks_like_numeric_value(lines[1]):
+        return [(lines[0], normalize_amount_token(lines[1]) if is_amount_token(lines[1]) else lines[1])]
+    if len(lines) == 3 and is_probable_label(lines[0]) and is_probable_label(lines[1]) and looks_like_numeric_value(lines[2]):
+        value = normalize_amount_token(lines[2]) if is_amount_token(lines[2]) else lines[2]
+        return [(f"{lines[0]} {lines[1]}", value)]
+    return []
+
+
+def looks_like_value_line(line: str) -> bool:
+    stripped = line.strip()
+    return (
+        looks_like_numeric_value(stripped)
+        or bool(re.fullmatch(r"\d{1,2}\s+[A-Za-z]{3},?\s+\d{4}", stripped))
+        or bool(re.fullmatch(r"\d{1,2}\s+[A-Za-z]+\s*,\s*\d{4}", stripped))
+    )
+
+
+def contains_transaction_marker(lines: list[str]) -> bool:
+    return any(
+        re.search(r"\d{2}/\d{2}/\d{4}", line)
+        or "transaction" in line.lower()
+        or "serno" in line.lower()
+        for line in lines
+    )
+
+
+def render_key_value_pairs(title: str, pairs: list[tuple[str, str]]) -> str:
+    table_rows = [[label, value] for label, value in pairs]
+    return "\n".join([f"### {title}", "", *render_markdown_table(["Field", "Value"], table_rows)])
+
+
+def build_structured_block_sections(page: pymupdf.Page) -> list[str]:
+    blocks = collect_text_blocks(page)
+    if not blocks:
+        return []
+
+    sections: list[str] = []
+    consumed: set[int] = set()
+    page_height = float(page.rect.height)
+
+    for index, block in enumerate(blocks):
+        if index in consumed or looks_like_footer_block(block, page_height):
+            continue
+
+        lines = block["lines"]
+        if contains_transaction_marker(lines):
+            continue
+
+        if index + 1 < len(blocks) and index + 1 not in consumed:
+            next_block = blocks[index + 1]
+            next_lines = next_block["lines"]
+            if (
+                len(lines) == 1
+                and len(next_lines) == 1
+                and is_probable_label(lines[0])
+                and looks_like_value_line(next_lines[0])
+                and abs(block["x0"] - next_block["x0"]) <= 90
+                and next_block["y0"] <= block["y1"] + 30
+            ):
+                sections.append(
+                    render_key_value_pairs(
+                        "Key Figures",
+                        [(lines[0], normalize_amount_token(next_lines[0]) if is_amount_token(next_lines[0]) else next_lines[0])],
+                    )
+                )
+                consumed.update({index, index + 1})
+                continue
+
+        inline_run: list[tuple[str, str]] = []
+        run_end = index
+        while run_end < len(blocks) and run_end not in consumed:
+            candidate = blocks[run_end]
+            if looks_like_footer_block(candidate, page_height):
+                break
+            if run_end > index and candidate["y0"] - blocks[run_end - 1]["y1"] > 24:
+                break
+            pairs = extract_inline_pairs(candidate["lines"])
+            if any(pair[0].strip().lower() in {"l", "pi"} for pair in pairs):
+                break
+            if contains_transaction_marker(candidate["lines"]):
+                break
+            if not pairs:
+                break
+            inline_run.extend(pairs)
+            run_end += 1
+
+        if len(inline_run) >= 2:
+            sections.append(render_key_value_pairs(f"Structured Section {len(sections) + 1}", inline_run))
+            consumed.update(range(index, run_end))
+            continue
+
+        if (
+            len(lines) == 1
+            and re.search(r"\bSR\s+NO\.", lines[0], flags=re.I)
+            and "transaction" in lines[0].lower()
+            and "amount" in lines[0].lower()
+            and index + 2 < len(blocks)
+        ):
+            data_lines = blocks[index + 1]["lines"]
+            total_lines = blocks[index + 2]["lines"]
+            if len(data_lines) == 3 and len(total_lines) == 2:
+                sections.append(
+                    "\n".join(
+                        [
+                            "### Cash Back Summary",
+                            "",
+                            *render_markdown_table(
+                                ["SR NO.", "Transaction", "Amount"],
+                                [[data_lines[0], data_lines[1], data_lines[2]], ["Total", "", total_lines[1]]],
+                            ),
+                        ]
+                    )
+                )
+                consumed.update({index, index + 1, index + 2})
+                continue
+
+        if (
+            len(lines) >= 4
+            and "gst entry" in " ".join(lines).lower()
+            and index + 1 < len(blocks)
+            and len(blocks[index + 1]["lines"]) >= 4
+        ):
+            headers = lines[:4]
+            values = blocks[index + 1]["lines"][:4]
+            sections.append(
+                "\n".join(
+                    [
+                        "### GST Summary",
+                        "",
+                        *render_markdown_table(headers, [values]),
+                    ]
+                )
+            )
+            consumed.update({index, index + 1})
+
+    return sections
 
 
 def looks_like_account_marker(line: str) -> bool:
@@ -872,7 +1108,7 @@ def render_transaction_sections(
 
 
 def extract_transaction_sections_from_text(text: str) -> list[str]:
-    lines = [line for line in text.splitlines() if not is_noise_line(line)]
+    lines = [line for line in text.splitlines() if line.strip() and not is_noise_line(line)]
     output: list[str] = []
     index = 0
 
@@ -905,11 +1141,15 @@ def extract_transaction_sections_from_text(text: str) -> list[str]:
             if not current:
                 index += 1
                 continue
+            lowered = current.lower()
             if looks_like_account_marker(current):
                 if rows:
                     sections.append((current_account, rows))
                     rows = []
                 current_account = current
+                index += 1
+                continue
+            if re.fullmatch(r"\d+%", current) or lowered.startswith("others-") or lowered == "spends overview":
                 index += 1
                 continue
 
@@ -940,7 +1180,7 @@ def extract_transaction_sections_from_text(text: str) -> list[str]:
 
 
 def extract_datetime_transaction_sections_from_text(text: str) -> list[str]:
-    lines = [line for line in text.splitlines() if not is_noise_line(line)]
+    lines = [line for line in text.splitlines() if line.strip() and not is_noise_line(line)]
     index = 0
 
     while index < len(lines):
@@ -966,6 +1206,9 @@ def extract_datetime_transaction_sections_from_text(text: str) -> list[str]:
 
         rows: list[list[str]] = []
         while index < len(lines):
+            if not lines[index]:
+                index += 1
+                continue
             parsed = parse_datetime_transaction_row_multiline(lines, index)
             if parsed is None:
                 break
@@ -1004,6 +1247,9 @@ def skip_statement_transaction_block(lines: list[str], index: int) -> int:
         if looks_like_account_marker(current) or parse_statement_transaction_row(current) is not None:
             index += 1
             continue
+        if re.fullmatch(r"\d+%", current) or lowered.startswith("others-") or lowered == "spends overview":
+            index += 1
+            continue
         if any(
             token in lowered
             for token in ("date", "serno", "transaction", "reward", "points", "intl", "amount")
@@ -1016,6 +1262,24 @@ def skip_statement_transaction_block(lines: list[str], index: int) -> int:
 
 def skip_datetime_transaction_block(lines: list[str], index: int) -> int:
     index += 1
+    skipped_context = 0
+    while index < len(lines):
+        current = lines[index]
+        lowered = current.lower()
+        if not current:
+            index += 1
+            continue
+        if re.fullmatch(r"(\d{2}/\d{2}/\d{4})\|\s*(\d{2}:\d{2})", current):
+            break
+        if any(token in lowered for token in ("date", "time", "transaction", "amount", "description", "pi")):
+            index += 1
+            continue
+        if skipped_context < 6:
+            skipped_context += 1
+            index += 1
+            continue
+        break
+
     while index < len(lines):
         current = lines[index]
         lowered = current.lower()
@@ -1037,6 +1301,15 @@ def skip_datetime_transaction_block(lines: list[str], index: int) -> int:
     return index
 
 
+def next_non_empty_line_index(lines: list[str], start: int) -> int | None:
+    index = start
+    while index < len(lines):
+        if lines[index].strip():
+            return index
+        index += 1
+    return None
+
+
 def format_generic_text_page(text: str) -> str:
     lines = [line for line in text.splitlines() if not is_noise_line(line)]
     output: list[str] = []
@@ -1045,6 +1318,117 @@ def format_generic_text_page(text: str) -> str:
 
     while index < len(lines):
         line = lines[index]
+        lowered = line.lower()
+
+        if re.fullmatch(r"page\s+\d+\s+of\s+\d+", line, flags=re.I):
+            index += 1
+            continue
+        if lowered in {"digitally", "signed by", "date:"}:
+            index += 1
+            continue
+        if line == "l":
+            next_index = next_non_empty_line_index(lines, index + 1)
+            if next_index is not None and lines[next_index] != "l":
+                bullet_parts = [lines[next_index]]
+                follow_index = next_index + 1
+                while follow_index < len(lines):
+                    candidate = lines[follow_index]
+                    if not candidate.strip():
+                        break
+                    if candidate == "l":
+                        break
+                    bullet_parts.append(candidate)
+                    follow_index += 1
+                bullet_text = " ".join(part.strip() for part in bullet_parts if part.strip())
+                if bullet_text.startswith("- "):
+                    trailing_index = next_non_empty_line_index(lines, follow_index)
+                    if (
+                        trailing_index is not None
+                        and trailing_index == follow_index + 1
+                        and len(lines[trailing_index]) <= 12
+                        and re.search(r"\d", lines[trailing_index])
+                    ):
+                        output.append(f"{bullet_text} {lines[trailing_index]}")
+                        index = trailing_index + 1
+                        continue
+                    output.append(bullet_text)
+                else:
+                    output.append(f"- {bullet_text}")
+                index = follow_index
+                continue
+            index += 1
+            continue
+        if lowered == "cash back summary":
+            idx1 = next_non_empty_line_index(lines, index + 1)
+            idx2 = next_non_empty_line_index(lines, (idx1 or index) + 1) if idx1 is not None else None
+            idx3 = next_non_empty_line_index(lines, (idx2 or index) + 1) if idx2 is not None else None
+            idx4 = next_non_empty_line_index(lines, (idx3 or index) + 1) if idx3 is not None else None
+            idx5 = next_non_empty_line_index(lines, (idx4 or index) + 1) if idx4 is not None else None
+            idx6 = next_non_empty_line_index(lines, (idx5 or index) + 1) if idx5 is not None else None
+            idx7 = next_non_empty_line_index(lines, (idx6 or index) + 1) if idx6 is not None else None
+            idx8 = next_non_empty_line_index(lines, (idx7 or index) + 1) if idx7 is not None else None
+            if (
+                idx1 is not None
+                and idx2 is not None
+                and idx3 is not None
+                and idx4 is not None
+                and idx5 is not None
+                and idx6 is not None
+                and idx7 is not None
+                and idx8 is not None
+                and lines[idx1].upper() == "SR NO."
+                and lines[idx2].upper() == "TRANSACTION"
+                and lines[idx3].upper() == "AMOUNT"
+            ):
+                output.append("### Cash Back Summary")
+                output.append("")
+                output.extend(
+                    render_markdown_table(
+                        ["SR NO.", "Transaction", "Amount"],
+                        [[lines[idx4], lines[idx5], lines[idx6]], ["Total", "", lines[idx8]]],
+                    )
+                )
+                output.append("")
+                index = idx8 + 1
+                continue
+
+        if (
+            line == "GST Entry"
+            and (header_start := next_non_empty_line_index(lines, index + 1)) is not None
+            and header_start + 12 < len(lines)
+        ):
+            compact = [entry for entry in lines[header_start : header_start + 13] if entry.strip()]
+            if len(compact) >= 12 and compact[1] == "Type" and compact[4] == "Rate %":
+                output.append("### GST Summary")
+                output.append("")
+                output.extend(
+                    render_markdown_table(
+                        ["GST Entry", "GST Type", "Invoice Number", "GST Rate %", "State Code"],
+                        [[compact[7], compact[8], compact[9], compact[10], compact[11]]],
+                    )
+                )
+                output.append("")
+                index = header_start + 13
+                continue
+
+        if (
+            lowered == "cash back summary"
+            and index + 8 < len(lines)
+            and lines[index + 1].upper() == "SR NO."
+            and lines[index + 2].upper() == "TRANSACTION"
+            and lines[index + 3].upper() == "AMOUNT"
+        ):
+            output.append("### Cash Back Summary")
+            output.append("")
+            output.extend(
+                render_markdown_table(
+                    ["SR NO.", "Transaction", "Amount"],
+                    [[lines[index + 4], lines[index + 5], lines[index + 6]], ["Total", "", lines[index + 8]]],
+                )
+            )
+            output.append("")
+            index += 9
+            continue
 
         if emitted_transactions and looks_like_transaction_header_window(lines, index):
             index = skip_statement_transaction_block(lines, index)
@@ -1429,6 +1813,7 @@ def extract_text_markdown(
     page_labels: list[int] | None = None,
     *,
     include_tables: bool = True,
+    include_selective_ocr: bool = True,
 ) -> tuple[str, int]:
     document = pymupdf.open(str(pdf_path))
     tables_by_page = extract_page_tables(pdf_path) if include_tables else []
@@ -1437,7 +1822,11 @@ def extract_text_markdown(
 
     for page_index in range(1, document.page_count + 1):
         page_label = page_labels[page_index - 1] if page_labels and page_index - 1 < len(page_labels) else page_index
-        text = normalize_extracted_text(document[page_index - 1].get_text("text") or "")
+        page = document[page_index - 1]
+        text = extract_sorted_page_text(
+            page,
+            include_selective_ocr=include_selective_ocr,
+        )
         total_chars += len(text)
         page_lines: list[str] = [f"## Page {page_label}", ""]
 
@@ -1494,6 +1883,7 @@ def convert_pdf_to_markdown(
             pdf_path,
             page_labels=page_labels,
             include_tables=False,
+            include_selective_ocr=False,
         )
         if total_chars < 400:
             try:
@@ -1522,6 +1912,7 @@ def convert_pdf_to_markdown(
                 pdf_path,
                 page_labels=page_labels,
                 include_tables=True,
+                include_selective_ocr=True,
             )
             if total_chars < 400:
                 result = get_converter().convert(str(pdf_path))
