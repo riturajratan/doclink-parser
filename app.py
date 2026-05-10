@@ -2008,6 +2008,7 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             )
 
     def handle_api_convert(self) -> None:
+        response_format = self.api_response_format()
         try:
             saved_pdf, password, original_filename, pages_value = self.parse_api_input()
             ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
@@ -2017,6 +2018,9 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
                 page_labels=selected_pages,
                 document_title=markdown_title_from_filename(original_filename),
             )
+            if response_format == "markdown":
+                self.respond_markdown(markdown)
+                return
             self.respond_json(
                 {
                     "success": True,
@@ -2030,15 +2034,37 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
                 }
             )
         except AppError as exc:
+            if response_format == "markdown":
+                self.respond_text(str(exc) + "\n", status=HTTPStatus.BAD_REQUEST)
+                return
             self.respond_json(
                 {"success": False, "error": str(exc)},
                 status=HTTPStatus.BAD_REQUEST,
             )
         except Exception as exc:  # pragma: no cover - local server guardrail
+            if response_format == "markdown":
+                self.respond_text(
+                    f"Unexpected error: {exc}\n",
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
             self.respond_json(
                 {"success": False, "error": f"Unexpected error: {exc}"},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    def api_response_format(self) -> str:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        requested_format = query.get("format", [""])[0].strip().lower()
+        if requested_format == "markdown":
+            return "markdown"
+
+        accept = self.headers.get("Accept", "").lower()
+        if "text/markdown" in accept or "text/plain" in accept:
+            return "markdown"
+
+        return "json"
 
     def parse_api_input(self) -> tuple[Path, str, str, str]:
         content_type = self.headers.get("Content-Type", "")
@@ -2127,6 +2153,14 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def respond_markdown(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, format: str, *args) -> None:
         return
