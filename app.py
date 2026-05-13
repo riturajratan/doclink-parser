@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import threading
 import time
 from email.parser import BytesParser
 from http import HTTPStatus
@@ -28,7 +29,7 @@ from pypdf import PdfReader, PdfWriter
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8010"))
-PREWARM_ON_STARTUP = os.environ.get("PREWARM_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no"}
+PREWARM_ON_STARTUP = os.environ.get("PREWARM_ON_STARTUP", "0").strip().lower() not in {"0", "false", "no"}
 PROJECT_ROOT = Path(__file__).resolve().parent
 STORAGE_DIR = PROJECT_ROOT / "storage"
 UPLOADS_DIR = STORAGE_DIR / "uploads"
@@ -36,6 +37,8 @@ OUTPUTS_DIR = STORAGE_DIR / "outputs"
 TMP_DIR = STORAGE_DIR / "tmp"
 CONVERTER: Any | None = None
 OCR_ENGINE: Any | None = None
+CONVERTER_LOCK = threading.Lock()
+OCR_ENGINE_LOCK = threading.Lock()
 SUPPORTED_UPLOAD_EXTENSIONS = {
     ".pdf",
     ".docx",
@@ -80,10 +83,12 @@ def get_converter():
     global CONVERTER
 
     if CONVERTER is None:
-        configure_temp_directory()
-        from docling.document_converter import DocumentConverter
+        with CONVERTER_LOCK:
+            if CONVERTER is None:
+                configure_temp_directory()
+                from docling.document_converter import DocumentConverter
 
-        CONVERTER = DocumentConverter()
+                CONVERTER = DocumentConverter()
 
     return CONVERTER
 
@@ -92,9 +97,11 @@ def get_ocr_engine():
     global OCR_ENGINE
 
     if OCR_ENGINE is None:
-        from rapidocr import RapidOCR
+        with OCR_ENGINE_LOCK:
+            if OCR_ENGINE is None:
+                from rapidocr import RapidOCR
 
-        OCR_ENGINE = RapidOCR()
+                OCR_ENGINE = RapidOCR()
 
     return OCR_ENGINE
 
@@ -2190,6 +2197,13 @@ def warmup_runtime() -> None:
     print(f"Docling runtime warmup complete in {duration:.2f}s")
 
 
+def warmup_runtime_background() -> None:
+    try:
+        warmup_runtime()
+    except Exception as exc:
+        print(f"Docling runtime warmup failed: {exc}")
+
+
 class PdfMarkdownHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -2433,10 +2447,10 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     configure_temp_directory()
-    if PREWARM_ON_STARTUP:
-        warmup_runtime()
     server = ThreadingHTTPServer((HOST, PORT), PdfMarkdownHandler)
     print(f"Serving PDF to Markdown app on http://{HOST}:{PORT}")
+    if PREWARM_ON_STARTUP:
+        threading.Thread(target=warmup_runtime_background, name="docling-warmup", daemon=True).start()
     server.serve_forever()
 
 

@@ -80,7 +80,7 @@ This app is ready for Railway-style deployment because it reads `PORT` from the 
 
 The repo now includes a root [Dockerfile](/Users/riturajratan/Projects/docling-pdf-markdown/Dockerfile:1), and Railway will prefer that automatically. This avoids the missing `libxcb.so.1` / OpenCV runtime issue by explicitly installing the required native OCR and image-processing libraries. On Debian `trixie`, this uses `libglx-mesa0` instead of the removed transitional package `libgl1-mesa-glx`.
 
-The image also runs [warmup_models.py](/Users/riturajratan/Projects/docling-pdf-markdown/warmup_models.py:1) during build so RapidOCR and Docling models are downloaded before the app handles live traffic. The server repeats a lightweight warmup on startup, which helps avoid first-request timeouts on platforms like Railway.
+The image also runs [warmup_models.py](/Users/riturajratan/Projects/docling-pdf-markdown/warmup_models.py:1) during build so RapidOCR and Docling models are downloaded before the app handles live traffic. Startup warmup is now disabled by default so the server can bind its port immediately on Railway; if you ever want it, enable `PREWARM_ON_STARTUP=1` and it will run in the background instead of blocking startup.
 
 Suggested start command:
 
