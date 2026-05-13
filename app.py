@@ -33,6 +33,30 @@ UPLOADS_DIR = STORAGE_DIR / "uploads"
 OUTPUTS_DIR = STORAGE_DIR / "outputs"
 TMP_DIR = STORAGE_DIR / "tmp"
 CONVERTER: Any | None = None
+OCR_ENGINE: Any | None = None
+SUPPORTED_UPLOAD_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".md",
+    ".markdown",
+    ".html",
+    ".htm",
+    ".csv",
+    ".adoc",
+    ".asciidoc",
+    ".tex",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".webp",
+    ".vtt",
+}
+UPLOAD_FIELD_NAMES = ("document", "file", "pdf")
 
 
 class AppError(Exception):
@@ -62,19 +86,70 @@ def get_converter():
     return CONVERTER
 
 
+def get_ocr_engine():
+    global OCR_ENGINE
+
+    if OCR_ENGINE is None:
+        from rapidocr import RapidOCR
+
+        OCR_ENGINE = RapidOCR()
+
+    return OCR_ENGINE
+
+
 def sanitize_filename(filename: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
-    return cleaned or "upload.pdf"
+    return cleaned or "upload.bin"
 
 
 def markdown_title_from_filename(filename: str) -> str:
-    stem = Path(filename or "upload.pdf").stem
+    stem = Path(filename or "upload").stem
     cleaned = stem.replace("_", " ").strip()
-    return cleaned or "PDF Document"
+    return cleaned or "Document"
+
+
+def is_pdf_path(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf"
+
+
+def save_upload_bytes(payload: bytes, filename: str) -> Path:
+    original_name = sanitize_filename(Path(filename or "upload.bin").name)
+    extension = Path(original_name).suffix.lower()
+
+    if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_UPLOAD_EXTENSIONS))
+        raise AppError(f"Unsupported file type `{extension or '[none]'}`. Supported types: {supported}.")
+    if not payload:
+        raise AppError("The uploaded file is empty.")
+
+    upload_name = f"{uuid4().hex}_{original_name}"
+    upload_path = UPLOADS_DIR / upload_name
+    upload_path.write_bytes(payload)
+    return upload_path
+
+
+def normalize_ocr_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if not mode:
+        return "off"
+    if mode in {"off", "false", "0", "no"}:
+        return "off"
+    if mode in {"selective", "on", "true", "1", "yes"}:
+        return "selective"
+    raise AppError("Invalid OCR mode. Use `off` or `selective`.")
+
+
+def ocr_mode_uses_selective_ocr(value: str) -> bool:
+    return normalize_ocr_mode(value) == "selective"
 
 
 def render_page(
-    *, markdown: str = "", error: str = "", output_name: str = "", pages_value: str = ""
+    *,
+    markdown: str = "",
+    error: str = "",
+    output_name: str = "",
+    pages_value: str = "",
+    ocr_mode: str = "off",
 ) -> bytes:
     result_block = ""
 
@@ -109,7 +184,7 @@ def render_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PDF to Markdown</title>
+  <title>Docling Document Reader</title>
   <style>
     :root {{
       color-scheme: light;
@@ -181,7 +256,9 @@ def render_page(
     }}
 
     input[type="file"],
-    input[type="password"] {{
+    input[type="password"],
+    input[type="text"],
+    select {{
       width: 100%;
       padding: 14px 16px;
       border-radius: 14px;
@@ -327,35 +404,44 @@ def render_page(
     <div id="progressCard" class="progress-card" aria-hidden="true">
       <div class="loading-spinner"></div>
       <div>
-        <p class="loading-title">Processing PDF</p>
-        <p class="loading-copy">Decrypting, extracting structure, and preparing markdown. Large or scanned PDFs may take longer.</p>
+        <p class="loading-title">Processing document</p>
+        <p class="loading-copy">Running Docling and preparing markdown output. Large or scanned files may take longer.</p>
       </div>
     </div>
     <section class="hero">
-      <h1>PDF to Markdown</h1>
-      <p>Upload a PDF, optionally provide a password for encrypted files, and get Markdown generated through Docling.</p>
+      <h1>Docling Document Reader</h1>
+      <p>Upload a supported document and get Markdown generated through Docling. PDF-only options stay available for locked files and page ranges.</p>
     </section>
 
     <section class="card">
       <form id="convertForm" action="/convert" method="post" enctype="multipart/form-data">
         <div>
-          <label for="pdf">PDF file</label>
-          <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf" required>
-          <p class="hint">Regular PDFs work directly. Encrypted PDFs need the document password below.</p>
+          <label for="document">Document file</label>
+          <input id="document" name="document" type="file" accept=".pdf,.docx,.pptx,.xlsx,.md,.markdown,.html,.htm,.csv,.adoc,.asciidoc,.tex,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.vtt" required>
+          <p class="hint">Supported inputs include PDF, DOCX, PPTX, XLSX, Markdown, HTML, CSV, common image formats, and more.</p>
         </div>
 
         <div>
           <label for="password">PDF password (optional)</label>
-          <input id="password" name="password" type="password" placeholder="Only needed for locked PDFs">
+          <input id="password" name="password" type="password" placeholder="Only needed for encrypted PDFs">
         </div>
 
         <div>
-          <label for="pages">Pages to parse (optional)</label>
+          <label for="pages">Pages to parse (PDF only)</label>
           <input id="pages" name="pages" type="text" placeholder="Examples: 1-3 or 2,5,7" value="{html.escape(pages_value)}">
-          <p class="hint">Leave empty to parse the full PDF.</p>
+          <p class="hint">Leave empty to parse the full document. Page selection applies only to PDFs.</p>
         </div>
 
-        <button id="submitButton" type="submit">Convert to Markdown</button>
+        <div>
+          <label for="ocr_mode">OCR mode (PDF only)</label>
+          <select id="ocr_mode" name="ocr_mode">
+            <option value="off"{" selected" if ocr_mode == "off" else ""}>Off</option>
+            <option value="selective"{" selected" if ocr_mode == "selective" else ""}>Selective OCR</option>
+          </select>
+          <p class="hint">Selective OCR adds text from embedded images like logos, headers, and scanned banners, but can add noise on digital PDFs.</p>
+        </div>
+
+        <button id="submitButton" type="submit">Read with Docling</button>
       </form>
     </section>
 
@@ -399,18 +485,6 @@ def render_page(
 </html>
 """
     return page.encode("utf-8")
-
-
-def save_pdf_bytes(payload: bytes, filename: str) -> Path:
-    original_name = sanitize_filename(Path(filename or "upload.pdf").name)
-    if not original_name.lower().endswith(".pdf"):
-        raise AppError("Only PDF files are supported.")
-    if not payload:
-        raise AppError("The uploaded file is empty.")
-    upload_name = f"{uuid4().hex}_{original_name}"
-    upload_path = UPLOADS_DIR / upload_name
-    upload_path.write_bytes(payload)
-    return upload_path
 
 
 def parse_page_selection(selection: str, total_pages: int) -> list[int]:
@@ -641,6 +715,97 @@ def has_significant_image_blocks(page: pymupdf.Page) -> bool:
     return False
 
 
+def should_ocr_image_block(page: pymupdf.Page, bbox: tuple[float, float, float, float]) -> bool:
+    x0, y0, x1, y1 = bbox
+    width = max(x1 - x0, 0)
+    height = max(y1 - y0, 0)
+    if width < 36 or height < 18:
+        return False
+
+    page_area = max(page.rect.width * page.rect.height, 1)
+    block_area = width * height
+    area_ratio = block_area / page_area
+
+    if area_ratio >= 0.003:
+        return True
+    if y0 <= page.rect.height * 0.28 and width >= 80:
+        return True
+    return height >= 28 and width >= 120
+
+
+def normalize_ocr_text_line(text: str) -> str:
+    text = normalize_extracted_text(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
+    candidate_rects: list[pymupdf.Rect] = []
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 1:
+            continue
+        bbox = tuple(float(value) for value in block.get("bbox", (0, 0, 0, 0)))
+        if not should_ocr_image_block(page, bbox):
+            continue
+        candidate_rects.append(pymupdf.Rect(*bbox))
+
+    if not candidate_rects:
+        return []
+
+    candidate_rects.sort(key=lambda rect: (rect.y0, -(rect.width * rect.height)))
+    ocr = get_ocr_engine()
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    for rect in candidate_rects[:6]:
+        try:
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=rect, alpha=False)
+            ocr_output = ocr(pixmap.tobytes("png"))
+        except Exception:
+            continue
+
+        texts = getattr(ocr_output, "txts", ()) or ()
+        scores = getattr(ocr_output, "scores", ()) or ()
+        for index, raw_text in enumerate(texts):
+            score = float(scores[index]) if index < len(scores) else 1.0
+            if score < 0.45:
+                continue
+            line = normalize_ocr_text_line(str(raw_text))
+            if not is_useful_ocr_line(line):
+                continue
+            folded = line.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            lines.append(line)
+
+    return lines
+
+
+def append_image_ocr_sections(
+    markdown: str,
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+) -> str:
+    document = pymupdf.open(str(pdf_path))
+    sections: list[str] = []
+
+    for page_index in range(document.page_count):
+        page = document[page_index]
+        lines = extract_text_from_image_blocks(page)
+        if not lines:
+            continue
+        page_label = page_labels[page_index] if page_labels and page_index < len(page_labels) else page_index + 1
+        bullet_lines = "\n".join(f"- {line}" for line in lines)
+        sections.append(f"### Page {page_label} image text\n\n{bullet_lines}")
+
+    if not sections:
+        return markdown
+
+    appendix = "\n\n".join(["## Image OCR", *sections])
+    return "\n\n".join(part for part in [markdown.strip(), appendix] if part).strip()
+
+
 def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool = True) -> str:
     blocks = page.get_text("blocks", sort=True)
     block_texts: list[str] = []
@@ -658,14 +823,25 @@ def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool 
     if not include_selective_ocr or not has_significant_image_blocks(page):
         return base_text
 
+    supplement_lines: list[str] = []
+    existing = {line.casefold() for line in normalize_text_lines(base_text)}
+
+    for line in extract_text_from_image_blocks(page):
+        folded = line.casefold()
+        if folded in existing:
+            continue
+        supplement_lines.append(line)
+        existing.add(folded)
+
     try:
         ocr_textpage = page.get_textpage_ocr(flags=0, language="eng", dpi=150, full=False)
         ocr_text = page.get_text("text", textpage=ocr_textpage)
     except Exception:
-        return base_text
+        if not supplement_lines:
+            return base_text
+        supplement = "\n".join(supplement_lines)
+        return "\n\n".join(part for part in [base_text, supplement] if part).strip()
 
-    existing = {line.casefold() for line in normalize_text_lines(base_text)}
-    supplement_lines: list[str] = []
     for line in normalize_text_lines(ocr_text):
         if not is_useful_ocr_line(line):
             continue
@@ -1874,14 +2050,32 @@ def is_text_based_pdf(pdf_path: Path, sample_pages: int = 3) -> bool:
     return chars >= 500
 
 
+def convert_with_docling(source_path: Path) -> str:
+    result = get_converter().convert(str(source_path))
+    return result.document.export_to_markdown().strip()
+
+
 def convert_pdf_to_markdown(
     pdf_path: Path,
     page_labels: list[int] | None = None,
     *,
     document_title: str | None = None,
+    ocr_mode: str = "off",
 ) -> tuple[str, Path]:
     markdown = ""
     text_based = False
+    use_selective_ocr = ocr_mode_uses_selective_ocr(ocr_mode)
+
+    try:
+        markdown = clean_markdown_output(convert_with_docling(pdf_path))
+    except Exception:
+        markdown = ""
+
+    if len(markdown.strip()) >= 200 and not use_selective_ocr:
+        output_name = f"{pdf_path.stem}.md"
+        output_path = OUTPUTS_DIR / output_name
+        output_path.write_text(markdown, encoding="utf-8")
+        return markdown, output_path
 
     try:
         text_based = is_text_based_pdf(pdf_path)
@@ -1893,7 +2087,7 @@ def convert_pdf_to_markdown(
             pdf_path,
             page_labels=page_labels,
             include_tables=False,
-            include_selective_ocr=False,
+            include_selective_ocr=use_selective_ocr,
             document_title=document_title,
         )
         if total_chars < 400:
@@ -1906,8 +2100,7 @@ def convert_pdf_to_markdown(
                     document_title=document_title,
                 )
             except Exception:
-                result = get_converter().convert(str(pdf_path))
-                markdown = result.document.export_to_markdown()
+                markdown = clean_markdown_output(convert_with_docling(pdf_path))
     else:
         try:
             markdown = convert_with_pymupdf4llm(
@@ -1929,13 +2122,41 @@ def convert_pdf_to_markdown(
                 document_title=document_title,
             )
             if total_chars < 400:
-                result = get_converter().convert(str(pdf_path))
-                markdown = result.document.export_to_markdown()
+                markdown = clean_markdown_output(convert_with_docling(pdf_path))
+
+    if use_selective_ocr and markdown.strip():
+        markdown = append_image_ocr_sections(markdown, pdf_path, page_labels)
 
     output_name = f"{pdf_path.stem}.md"
     output_path = OUTPUTS_DIR / output_name
     output_path.write_text(markdown, encoding="utf-8")
     return markdown, output_path
+
+
+def convert_document_to_markdown(
+    source_path: Path,
+    *,
+    password: str = "",
+    pages_value: str = "",
+    document_title: str | None = None,
+    ocr_mode: str = "off",
+) -> tuple[str, Path, list[int], int]:
+    if is_pdf_path(source_path):
+        ready_pdf = unlock_pdf_if_needed(source_path, password)
+        parse_pdf, selected_pages, total_pages = select_pdf_pages(ready_pdf, pages_value)
+        markdown, output_path = convert_pdf_to_markdown(
+            parse_pdf,
+            page_labels=selected_pages,
+            document_title=document_title,
+            ocr_mode=ocr_mode,
+        )
+        return markdown, output_path, selected_pages, total_pages
+
+    markdown = clean_markdown_output(convert_with_docling(source_path))
+    output_name = f"{source_path.stem}.md"
+    output_path = OUTPUTS_DIR / output_name
+    output_path.write_text(markdown, encoding="utf-8")
+    return markdown, output_path, [], 0
 
 
 class PdfMarkdownHandler(BaseHTTPRequestHandler):
@@ -1957,11 +2178,13 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_POST(self) -> None:
-        if self.path == "/api/convert":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/api/convert":
             self.handle_api_convert()
             return
 
-        if self.path != "/convert":
+        if parsed.path != "/convert":
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
 
@@ -1971,31 +2194,37 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             fields, files = parse_multipart_form(content_type, body)
 
-            pdf_file = files.get("pdf")
-            if pdf_file is None:
-                raise AppError("Choose a PDF file to upload.")
+            upload = next((files.get(field_name) for field_name in UPLOAD_FIELD_NAMES if files.get(field_name)), None)
+            if upload is None:
+                raise AppError("Choose a supported document file to upload.")
 
-            filename, payload = pdf_file
+            filename, payload = upload
             password = fields.get("password", "").strip()
             pages_value = fields.get("pages", "").strip()
-            saved_pdf = save_pdf_bytes(payload, filename)
-            ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
-            parse_pdf, selected_pages, _ = select_pdf_pages(ready_pdf, pages_value)
-            markdown, output_path = convert_pdf_to_markdown(
-                parse_pdf,
-                page_labels=selected_pages,
+            ocr_mode = normalize_ocr_mode(fields.get("ocr_mode", "off"))
+            saved_document = save_upload_bytes(payload, filename)
+            markdown, output_path, _, _ = convert_document_to_markdown(
+                saved_document,
+                password=password,
+                pages_value=pages_value,
                 document_title=markdown_title_from_filename(filename),
+                ocr_mode=ocr_mode,
             )
             self.respond_html(
                 render_page(
                     markdown=markdown,
                     output_name=output_path.name,
                     pages_value=pages_value,
+                    ocr_mode=ocr_mode,
                 )
             )
         except AppError as exc:
             self.respond_html(
-                render_page(error=str(exc), pages_value=fields.get("pages", "").strip() if "fields" in locals() else ""),
+                render_page(
+                    error=str(exc),
+                    pages_value=fields.get("pages", "").strip() if "fields" in locals() else "",
+                    ocr_mode=fields.get("ocr_mode", "off").strip() if "fields" in locals() else "off",
+                ),
                 status=HTTPStatus.BAD_REQUEST,
             )
         except Exception as exc:  # pragma: no cover - local server guardrail
@@ -2003,6 +2232,7 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
                 render_page(
                     error=f"Unexpected error: {exc}",
                     pages_value=fields.get("pages", "").strip() if "fields" in locals() else "",
+                    ocr_mode=fields.get("ocr_mode", "off").strip() if "fields" in locals() else "off",
                 ),
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
@@ -2010,13 +2240,13 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
     def handle_api_convert(self) -> None:
         response_format = self.api_response_format()
         try:
-            saved_pdf, password, original_filename, pages_value = self.parse_api_input()
-            ready_pdf = unlock_pdf_if_needed(saved_pdf, password)
-            parse_pdf, selected_pages, total_pages = select_pdf_pages(ready_pdf, pages_value)
-            markdown, output_path = convert_pdf_to_markdown(
-                parse_pdf,
-                page_labels=selected_pages,
+            saved_document, password, original_filename, pages_value, ocr_mode = self.parse_api_input()
+            markdown, output_path, selected_pages, total_pages = convert_document_to_markdown(
+                saved_document,
+                password=password,
+                pages_value=pages_value,
                 document_title=markdown_title_from_filename(original_filename),
+                ocr_mode=ocr_mode,
             )
             if response_format == "markdown":
                 self.respond_markdown(markdown)
@@ -2025,11 +2255,13 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
                 {
                     "success": True,
                     "filename": original_filename,
-                    "stored_filename": parse_pdf.name,
+                    "stored_filename": saved_document.name,
                     "output_filename": output_path.name,
-                    "page_count": len(selected_pages),
-                    "total_page_count": total_pages,
+                    "page_count": len(selected_pages) if selected_pages else None,
+                    "total_page_count": total_pages or None,
                     "selected_pages": selected_pages,
+                    "ocr_mode": ocr_mode,
+                    "is_pdf": is_pdf_path(saved_document),
                     "markdown": markdown,
                 }
             )
@@ -2066,7 +2298,7 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
         return "json"
 
-    def parse_api_input(self) -> tuple[Path, str, str, str]:
+    def parse_api_input(self) -> tuple[Path, str, str, str, str]:
         content_type = self.headers.get("Content-Type", "")
 
         if content_type.startswith("application/json"):
@@ -2077,32 +2309,34 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as exc:
                 raise AppError(f"Invalid JSON body: {exc.msg}") from exc
 
-            pdf_base64 = payload.get("pdf_base64") or payload.get("file_base64")
-            if not pdf_base64:
-                raise AppError("JSON body must include `pdf_base64`.")
+            file_base64 = payload.get("document_base64") or payload.get("file_base64") or payload.get("pdf_base64")
+            if not file_base64:
+                raise AppError("JSON body must include `document_base64`, `file_base64`, or `pdf_base64`.")
 
             filename = str(payload.get("filename", "upload.pdf") or "upload.pdf")
             password = str(payload.get("password", "") or "").strip()
             pages_value = str(payload.get("pages", "") or "").strip()
+            ocr_mode = normalize_ocr_mode(str(payload.get("ocr_mode", "off") or "off"))
             try:
-                pdf_bytes = base64.b64decode(pdf_base64, validate=True)
+                file_bytes = base64.b64decode(file_base64, validate=True)
             except (binascii.Error, ValueError) as exc:
-                raise AppError("`pdf_base64` is not valid base64.") from exc
+                raise AppError("The provided base64 document payload is invalid.") from exc
 
-            return save_pdf_bytes(pdf_bytes, filename), password, filename, pages_value
+            return save_upload_bytes(file_bytes, filename), password, filename, pages_value, ocr_mode
 
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
         fields, files = parse_multipart_form(content_type, raw_body)
 
-        pdf_file = files.get("pdf")
-        if pdf_file is None:
-            raise AppError("Multipart form must include a `pdf` file field.")
+        upload = next((files.get(field_name) for field_name in UPLOAD_FIELD_NAMES if files.get(field_name)), None)
+        if upload is None:
+            raise AppError("Multipart form must include a `document`, `file`, or `pdf` field.")
 
-        original_filename, pdf_bytes = pdf_file
+        original_filename, file_bytes = upload
         password = fields.get("password", "").strip()
         pages_value = fields.get("pages", "").strip()
-        return save_pdf_bytes(pdf_bytes, original_filename), password, original_filename, pages_value
+        ocr_mode = normalize_ocr_mode(fields.get("ocr_mode", "off"))
+        return save_upload_bytes(file_bytes, original_filename), password, original_filename, pages_value, ocr_mode
 
     def handle_download(self, query_string: str) -> None:
         params = parse_qs(query_string)

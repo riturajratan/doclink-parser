@@ -1,6 +1,6 @@
-# PDF to Markdown
+# Docling Document Reader
 
-Small local web app that uploads a PDF, optionally unlocks it with a password, converts it into Markdown, and returns the result in the browser or API.
+Small local web app that uploads a supported document, runs it through Docling, and returns Markdown in the browser or API.
 
 ## Run
 
@@ -23,11 +23,22 @@ python3 app.py
 
 ## Notes
 
-- Uploaded PDFs are stored under `storage/uploads/`.
+- Uploaded files are stored under `storage/uploads/`.
 - Generated Markdown files are stored under `storage/outputs/`.
-- If the PDF is encrypted, enter the document password in the form before converting.
-- You can limit parsing to specific pages with values like `1-3` or `2,5,7`.
+- PDF, DOCX, PPTX, XLSX, Markdown, HTML, CSV, VTT, and common image formats are supported.
+- If the file is an encrypted PDF, enter the document password in the form before converting.
+- You can limit parsing to specific pages with values like `1-3` or `2,5,7` for PDFs.
+- For PDFs, set `ocr_mode=selective` when you want text pulled from embedded images such as bank logos, headers, or scanned snippets.
 - Default port is `8010`. Override it with `PORT=9000 python3 app.py` if needed.
+
+## Smoke test
+
+```bash
+cd /Users/riturajratan/projects/docling-pdf-markdown
+python3 check_docling.py
+```
+
+This creates temporary Markdown, HTML, and PDF samples and verifies that Docling can read them.
 
 ## API
 
@@ -37,15 +48,17 @@ Returns JSON with the extracted Markdown.
 
 Multipart form-data fields:
 
-- `pdf`: PDF file
+- `document`: preferred upload field for the source file
+- `file`: alternate upload field
+- `pdf`: backward-compatible upload field for PDFs
 - `password`: optional PDF password
-- `pages`: optional page selection like `1-3` or `2,5,7`
+- `pages`: optional page selection like `1-3` or `2,5,7` for PDFs
 
 Example:
 
 ```bash
 curl -X POST http://127.0.0.1:8010/api/convert \
-  -F "pdf=@/path/to/file.pdf" \
+  -F "document=@/path/to/file.pdf" \
   -F "password=secret" \
   -F "pages=1-3"
 ```
@@ -57,7 +70,7 @@ JSON body is also supported:
   "filename": "file.pdf",
   "password": "secret",
   "pages": "1-3",
-  "pdf_base64": "BASE64_ENCODED_PDF"
+  "document_base64": "BASE64_ENCODED_FILE"
 }
 ```
 
