@@ -1,0 +1,16 @@
+[phases.setup]
+aptPkgs = [
+  "...",
+  "libxcb1",
+  "libx11-6",
+  "libxext6",
+  "libxrender1",
+  "libxkbcommon0",
+  "libglib2.0-0",
+  "libgl1",
+  "libsm6",
+  "tesseract-ocr",
+]
+
+[start]
+cmd = "python3 app.py"

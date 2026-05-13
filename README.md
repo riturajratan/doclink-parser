@@ -78,6 +78,8 @@ JSON body is also supported:
 
 This app is ready for Railway-style deployment because it reads `PORT` from the environment and listens on `0.0.0.0`.
 
+The repo includes [nixpacks.toml](/Users/riturajratan/Projects/docling-pdf-markdown/nixpacks.toml:1) so Railway installs the native OCR / image-processing libraries required by Docling and the selective image OCR path.
+
 Suggested start command:
 
 ```bash
