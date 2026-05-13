@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libglib2.0-0 \
     libgl1 \
-    libgl1-mesa-glx \
+    libglx-mesa0 \
     libsm6 \
     libx11-6 \
     libxcb1 \
