@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,7 @@ from pypdf import PdfReader, PdfWriter
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8010"))
+PREWARM_ON_STARTUP = os.environ.get("PREWARM_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no"}
 PROJECT_ROOT = Path(__file__).resolve().parent
 STORAGE_DIR = PROJECT_ROOT / "storage"
 UPLOADS_DIR = STORAGE_DIR / "uploads"
@@ -2159,6 +2161,35 @@ def convert_document_to_markdown(
     return markdown, output_path, [], 0
 
 
+def write_warmup_pdf(path: Path) -> None:
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((72, 72), "Docling startup warmup")
+    page.insert_text((72, 104), "ICICI BANK")
+    document.save(path)
+    document.close()
+
+
+def warmup_runtime() -> None:
+    started_at = time.time()
+    configure_temp_directory()
+    print("Warming Docling runtime...")
+    get_ocr_engine()
+    get_converter()
+
+    warmup_dir = TMP_DIR / "warmup"
+    warmup_dir.mkdir(parents=True, exist_ok=True)
+    warmup_pdf = warmup_dir / "startup-warmup.pdf"
+    write_warmup_pdf(warmup_pdf)
+    convert_pdf_to_markdown(
+        warmup_pdf,
+        document_title="Startup Warmup",
+        ocr_mode="selective",
+    )
+    duration = time.time() - started_at
+    print(f"Docling runtime warmup complete in {duration:.2f}s")
+
+
 class PdfMarkdownHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -2402,6 +2433,8 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     configure_temp_directory()
+    if PREWARM_ON_STARTUP:
+        warmup_runtime()
     server = ThreadingHTTPServer((HOST, PORT), PdfMarkdownHandler)
     print(f"Serving PDF to Markdown app on http://{HOST}:{PORT}")
     server.serve_forever()

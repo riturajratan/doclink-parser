@@ -24,6 +24,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
+RUN python3 warmup_models.py
 
 EXPOSE 8010
 
