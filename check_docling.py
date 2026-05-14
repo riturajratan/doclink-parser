@@ -7,7 +7,7 @@ import pymupdf
 from docling.document_converter import DocumentConverter
 from PIL import Image, ImageDraw, ImageFont
 
-from app import convert_pdf_to_markdown
+from app import append_image_ocr_sections, convert_pdf_to_markdown
 
 
 def write_sample_pdf(path: Path) -> None:
@@ -45,6 +45,27 @@ def write_logo_image_pdf(path: Path) -> None:
     document.close()
 
 
+def write_mixed_text_and_logo_pdf(path: Path) -> None:
+    image = Image.new("RGB", (1000, 260), "white")
+    draw = ImageDraw.Draw(image)
+    font = load_logo_font(72)
+    draw.rounded_rectangle((24, 36, 190, 202), radius=28, fill="#f26b21")
+    draw.text((230, 78), "ICICI BANK", fill="black", font=font)
+
+    png_path = path.with_suffix(".png")
+    image.save(png_path)
+
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_image(pymupdf.Rect(48, 48, 548, 178), filename=str(png_path))
+    page.insert_text((48, 240), "15/03/2026| 19:05")
+    page.insert_text((48, 264), "PYU*Swiggy FoodBangalore")
+    page.insert_text((48, 288), "Rs 720.00")
+    page.insert_text((48, 312), "l")
+    document.save(path)
+    document.close()
+
+
 def main() -> int:
     converter = DocumentConverter()
 
@@ -68,6 +89,9 @@ def main() -> int:
 
         logo_pdf_file = root / "logo-only.pdf"
         write_logo_image_pdf(logo_pdf_file)
+
+        mixed_pdf_file = root / "mixed-text-and-logo.pdf"
+        write_mixed_text_and_logo_pdf(mixed_pdf_file)
 
         samples = {
             markdown_file: ["Smoke Test", "Docling should read this markdown file."],
@@ -93,6 +117,29 @@ def main() -> int:
             failures.append("logo-only.pdf: selective OCR did not extract `ICICI BANK` from the embedded image")
         else:
             print("[ok] logo-only.pdf image OCR")
+
+        mixed_without_ocr, _ = convert_pdf_to_markdown(
+            mixed_pdf_file,
+            document_title="Mixed OCR Test",
+            ocr_mode="off",
+        )
+        mixed_with_ocr, _ = convert_pdf_to_markdown(
+            mixed_pdf_file,
+            document_title="Mixed OCR Test",
+            ocr_mode="selective",
+        )
+        merged_page_markdown = append_image_ocr_sections(
+            "# Mixed OCR Test\n\n## Page 1\n\nTransaction table here.",
+            mixed_pdf_file,
+        )
+        if mixed_without_ocr not in mixed_with_ocr:
+            failures.append("mixed-text-and-logo.pdf: selective OCR changed the base markdown instead of extending it")
+        elif "ICICI BANK" not in mixed_with_ocr:
+            failures.append("mixed-text-and-logo.pdf: selective OCR did not merge image text into the markdown")
+        elif "## Page 1\n\nTransaction table here.\n\n### Image OCR" not in merged_page_markdown:
+            failures.append("mixed-text-and-logo.pdf: page-level markdown did not keep image OCR inline with the matching page")
+        else:
+            print("[ok] mixed-text-and-logo.pdf keeps base markdown and adds image OCR")
 
         if failures:
             print("[failed] Docling smoke test did not match expected text:")

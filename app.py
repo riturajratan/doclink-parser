@@ -791,13 +791,12 @@ def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
     return lines
 
 
-def append_image_ocr_sections(
-    markdown: str,
+def collect_page_image_ocr_lines(
     pdf_path: Path,
     page_labels: list[int] | None = None,
-) -> str:
+) -> dict[int, list[str]]:
     document = pymupdf.open(str(pdf_path))
-    sections: list[str] = []
+    page_sections: dict[int, list[str]] = {}
 
     for page_index in range(document.page_count):
         page = document[page_index]
@@ -805,14 +804,81 @@ def append_image_ocr_sections(
         if not lines:
             continue
         page_label = page_labels[page_index] if page_labels and page_index < len(page_labels) else page_index + 1
-        bullet_lines = "\n".join(f"- {line}" for line in lines)
-        sections.append(f"### Page {page_label} image text\n\n{bullet_lines}")
+        page_sections[page_label] = lines
 
-    if not sections:
+    return page_sections
+
+
+def dedupe_image_lines_for_markdown(section_markdown: str, lines: list[str]) -> list[str]:
+    existing_lines = normalize_text_lines(section_markdown)
+    existing_folded = {line.casefold() for line in existing_lines}
+    unique_lines: list[str] = []
+
+    for line in lines:
+        folded = line.casefold()
+        if folded in existing_folded:
+            continue
+        if any(folded in existing.casefold() or existing.casefold() in folded for existing in existing_lines):
+            continue
+        if any(folded == prior.casefold() for prior in unique_lines):
+            continue
+        unique_lines.append(line)
+
+    return unique_lines
+
+
+def append_image_ocr_sections(
+    markdown: str,
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+) -> str:
+    page_sections = collect_page_image_ocr_lines(pdf_path, page_labels)
+    if not page_sections:
         return markdown
 
-    appendix = "\n\n".join(["## Image OCR", *sections])
-    return "\n\n".join(part for part in [markdown.strip(), appendix] if part).strip()
+    parts = markdown.strip().split("\n\n---\n\n")
+    merged_parts: list[str] = []
+    consumed_labels: set[int] = set()
+
+    for part in parts:
+        match = re.search(r"^## Page (\d+)\s*$", part, flags=re.M)
+        if not match:
+            merged_parts.append(part)
+            continue
+
+        page_label = int(match.group(1))
+        image_lines = page_sections.get(page_label, [])
+        if not image_lines:
+            merged_parts.append(part)
+            continue
+
+        unique_lines = dedupe_image_lines_for_markdown(part, image_lines)
+        if not unique_lines:
+            merged_parts.append(part)
+            consumed_labels.add(page_label)
+            continue
+
+        image_block = "\n".join(
+            [
+                "### Image OCR",
+                "",
+                *(f"- {line}" for line in unique_lines),
+            ]
+        )
+        merged_parts.append(f"{part.rstrip()}\n\n{image_block}")
+        consumed_labels.add(page_label)
+
+    leftover_sections: list[str] = []
+    for page_label, lines in page_sections.items():
+        if page_label in consumed_labels:
+            continue
+        bullet_lines = "\n".join(f"- {line}" for line in lines)
+        leftover_sections.append(f"### Page {page_label} image text\n\n{bullet_lines}")
+
+    if leftover_sections:
+        merged_parts.append("\n\n".join(["## Image OCR", *leftover_sections]))
+
+    return "\n\n---\n\n".join(part.strip() for part in merged_parts if part.strip()).strip()
 
 
 def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool = True) -> str:
@@ -2074,17 +2140,12 @@ def convert_pdf_to_markdown(
     markdown = ""
     text_based = False
     use_selective_ocr = ocr_mode_uses_selective_ocr(ocr_mode)
+    total_chars = 0
 
     try:
         markdown = clean_markdown_output(convert_with_docling(pdf_path))
     except Exception:
         markdown = ""
-
-    if len(markdown.strip()) >= 200 and not use_selective_ocr:
-        output_name = f"{pdf_path.stem}.md"
-        output_path = OUTPUTS_DIR / output_name
-        output_path.write_text(markdown, encoding="utf-8")
-        return markdown, output_path
 
     try:
         text_based = is_text_based_pdf(pdf_path)
@@ -2092,24 +2153,25 @@ def convert_pdf_to_markdown(
         text_based = False
 
     if text_based:
-        markdown, total_chars = extract_text_markdown(
-            pdf_path,
-            page_labels=page_labels,
-            include_tables=False,
-            include_selective_ocr=use_selective_ocr,
-            document_title=document_title,
-        )
-        if total_chars < 400:
-            try:
-                markdown = convert_with_pymupdf4llm(
-                    pdf_path,
-                    page_labels=page_labels,
-                    use_ocr=False,
-                    force_text=False,
-                    document_title=document_title,
-                )
-            except Exception:
-                markdown = clean_markdown_output(convert_with_docling(pdf_path))
+        if len(markdown.strip()) < 200:
+            markdown, total_chars = extract_text_markdown(
+                pdf_path,
+                page_labels=page_labels,
+                include_tables=False,
+                include_selective_ocr=False,
+                document_title=document_title,
+            )
+            if total_chars < 400:
+                try:
+                    markdown = convert_with_pymupdf4llm(
+                        pdf_path,
+                        page_labels=page_labels,
+                        use_ocr=False,
+                        force_text=False,
+                        document_title=document_title,
+                    )
+                except Exception:
+                    markdown = clean_markdown_output(convert_with_docling(pdf_path))
     else:
         try:
             markdown = convert_with_pymupdf4llm(
@@ -2135,6 +2197,12 @@ def convert_pdf_to_markdown(
 
     if use_selective_ocr and markdown.strip():
         markdown = append_image_ocr_sections(markdown, pdf_path, page_labels)
+
+    if len(markdown.strip()) >= 200 and not use_selective_ocr:
+        output_name = f"{pdf_path.stem}.md"
+        output_path = OUTPUTS_DIR / output_name
+        output_path.write_text(markdown, encoding="utf-8")
+        return markdown, output_path
 
     output_name = f"{pdf_path.stem}.md"
     output_path = OUTPUTS_DIR / output_name
