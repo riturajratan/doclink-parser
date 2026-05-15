@@ -748,7 +748,7 @@ def normalize_ocr_text_line(text: str) -> str:
     return text
 
 
-def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
+def extract_grouped_text_from_image_blocks(page: pymupdf.Page) -> list[list[str]]:
     candidate_rects: list[pymupdf.Rect] = []
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 1:
@@ -763,10 +763,11 @@ def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
 
     candidate_rects.sort(key=lambda rect: (rect.y0, -(rect.width * rect.height)))
     ocr = get_ocr_engine()
-    lines: list[str] = []
     seen: set[str] = set()
+    groups: list[list[str]] = []
 
     for rect in candidate_rects[:6]:
+        group_lines: list[str] = []
         try:
             pixmap = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=rect, alpha=False)
             ocr_output = ocr(pixmap.tobytes("png"))
@@ -786,27 +787,50 @@ def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
             if folded in seen:
                 continue
             seen.add(folded)
-            lines.append(line)
+            group_lines.append(line)
 
-    return lines
+        if group_lines:
+            groups.append(group_lines)
+
+    return groups
 
 
-def collect_page_image_ocr_lines(
+def extract_text_from_image_blocks(page: pymupdf.Page) -> list[str]:
+    return [line for group in extract_grouped_text_from_image_blocks(page) for line in group]
+
+
+def collect_page_image_ocr_groups(
     pdf_path: Path,
     page_labels: list[int] | None = None,
-) -> dict[int, list[str]]:
+) -> dict[int, list[list[str]]]:
     document = pymupdf.open(str(pdf_path))
-    page_sections: dict[int, list[str]] = {}
+    page_sections: dict[int, list[list[str]]] = {}
 
     for page_index in range(document.page_count):
         page = document[page_index]
-        lines = extract_text_from_image_blocks(page)
-        if not lines:
+        groups = extract_grouped_text_from_image_blocks(page)
+        if not groups:
             continue
         page_label = page_labels[page_index] if page_labels and page_index < len(page_labels) else page_index + 1
-        page_sections[page_label] = lines
+        page_sections[page_label] = groups
 
     return page_sections
+
+
+def render_inline_image_ocr_block(lines: list[str]) -> str:
+    return "\n".join(
+        [
+            "### Image OCR",
+            "",
+            *(f"- {line}" for line in lines),
+        ]
+    )
+
+
+def remove_image_placeholders(markdown: str) -> str:
+    cleaned = re.sub(r"\n?<!-- image -->\n?", "\n", markdown)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def dedupe_image_lines_for_markdown(section_markdown: str, lines: list[str]) -> list[str]:
@@ -832,7 +856,7 @@ def append_image_ocr_sections(
     pdf_path: Path,
     page_labels: list[int] | None = None,
 ) -> str:
-    page_sections = collect_page_image_ocr_lines(pdf_path, page_labels)
+    page_sections = collect_page_image_ocr_groups(pdf_path, page_labels)
     if not page_sections:
         return markdown
 
@@ -847,38 +871,78 @@ def append_image_ocr_sections(
             continue
 
         page_label = int(match.group(1))
-        image_lines = page_sections.get(page_label, [])
-        if not image_lines:
+        image_groups = page_sections.get(page_label, [])
+        if not image_groups:
             merged_parts.append(part)
             continue
 
-        unique_lines = dedupe_image_lines_for_markdown(part, image_lines)
-        if not unique_lines:
-            merged_parts.append(part)
+        placeholder_count = part.count("<!-- image -->")
+        remaining_groups: list[list[str]] = []
+        page_text = part
+
+        if placeholder_count > 0:
+            for image_group in image_groups:
+                unique_lines = dedupe_image_lines_for_markdown(page_text, image_group)
+                if unique_lines:
+                    remaining_groups.append(unique_lines)
+
+            for unique_lines in remaining_groups[:placeholder_count]:
+                page_text = page_text.replace(
+                    "<!-- image -->",
+                    render_inline_image_ocr_block(unique_lines),
+                    1,
+                )
+
+            remaining_groups = remaining_groups[placeholder_count:]
+        else:
+            for image_group in image_groups:
+                unique_lines = dedupe_image_lines_for_markdown(page_text, image_group)
+                if unique_lines:
+                    remaining_groups.append(unique_lines)
+
+        if not remaining_groups:
+            merged_parts.append(page_text)
             consumed_labels.add(page_label)
             continue
 
-        image_block = "\n".join(
-            [
-                "### Image OCR",
-                "",
-                *(f"- {line}" for line in unique_lines),
-            ]
-        )
-        merged_parts.append(f"{part.rstrip()}\n\n{image_block}")
+        image_blocks = []
+        for unique_lines in remaining_groups:
+            image_blocks.append(
+                "\n".join(
+                    [
+                        "### Image OCR",
+                        "",
+                        *(f"- {line}" for line in unique_lines),
+                    ]
+                )
+            )
+        merged_parts.append(f"{page_text.rstrip()}\n\n" + "\n\n".join(image_blocks))
         consumed_labels.add(page_label)
 
     leftover_sections: list[str] = []
-    for page_label, lines in page_sections.items():
+    for page_label, groups in page_sections.items():
         if page_label in consumed_labels:
             continue
-        bullet_lines = "\n".join(f"- {line}" for line in lines)
-        leftover_sections.append(f"### Page {page_label} image text\n\n{bullet_lines}")
+        rendered_groups: list[str] = []
+        for group in groups:
+            rendered_groups.append(
+                "\n".join(
+                    [
+                        "### Image OCR",
+                        "",
+                        *(f"- {line}" for line in group),
+                    ]
+                )
+            )
+        leftover_sections.append(
+            "\n\n".join([f"### Page {page_label} image text", *rendered_groups])
+        )
 
     if leftover_sections:
         merged_parts.append("\n\n".join(["## Image OCR", *leftover_sections]))
 
-    return "\n\n---\n\n".join(part.strip() for part in merged_parts if part.strip()).strip()
+    merged_markdown = "\n\n---\n\n".join(part.strip() for part in merged_parts if part.strip()).strip()
+    return remove_image_placeholders(merged_markdown)
 
 
 def extract_sorted_page_text(page: pymupdf.Page, *, include_selective_ocr: bool = True) -> str:
@@ -2130,6 +2194,38 @@ def convert_with_docling(source_path: Path) -> str:
     return result.document.export_to_markdown().strip()
 
 
+def convert_with_docling_per_page(
+    pdf_path: Path,
+    page_labels: list[int] | None = None,
+    *,
+    document_title: str | None = None,
+) -> str:
+    reader = PdfReader(str(pdf_path))
+    page_sections: list[str] = []
+
+    with tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+
+        for page_index, page in enumerate(reader.pages, start=1):
+            page_label = page_labels[page_index - 1] if page_labels and page_index - 1 < len(page_labels) else page_index
+            page_path = temp_root / f"page_{page_label}.pdf"
+            writer = PdfWriter()
+            writer.add_page(page)
+            with page_path.open("wb") as handle:
+                writer.write(handle)
+
+            page_markdown = clean_markdown_output(convert_with_docling(page_path))
+            if not page_markdown:
+                continue
+            page_sections.append(f"## Page {page_label}\n\n{page_markdown.strip()}")
+
+    if not page_sections:
+        return ""
+
+    title = document_title or markdown_title_from_filename(pdf_path.stem.removesuffix("_unlocked"))
+    return f"# {title}\n\n" + "\n\n---\n\n".join(page_sections)
+
+
 def convert_pdf_to_markdown(
     pdf_path: Path,
     page_labels: list[int] | None = None,
@@ -2153,6 +2249,16 @@ def convert_pdf_to_markdown(
         text_based = False
 
     if text_based:
+        if use_selective_ocr:
+            try:
+                markdown = convert_with_docling_per_page(
+                    pdf_path,
+                    page_labels=page_labels,
+                    document_title=document_title,
+                )
+            except Exception:
+                pass
+
         if len(markdown.strip()) < 200:
             markdown, total_chars = extract_text_markdown(
                 pdf_path,

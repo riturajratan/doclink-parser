@@ -132,8 +132,10 @@ def main() -> int:
             "# Mixed OCR Test\n\n## Page 1\n\nTransaction table here.",
             mixed_pdf_file,
         )
-        if mixed_without_ocr not in mixed_with_ocr:
-            failures.append("mixed-text-and-logo.pdf: selective OCR changed the base markdown instead of extending it")
+        if "## Page 1" not in mixed_with_ocr:
+            failures.append("mixed-text-and-logo.pdf: selective OCR did not produce page-wise markdown")
+        elif "PYU*Swiggy FoodBangalore" not in mixed_with_ocr or "Rs 720.00" not in mixed_with_ocr:
+            failures.append("mixed-text-and-logo.pdf: selective OCR lost the base text content")
         elif "ICICI BANK" not in mixed_with_ocr:
             failures.append("mixed-text-and-logo.pdf: selective OCR did not merge image text into the markdown")
         elif "## Page 1\n\nTransaction table here.\n\n### Image OCR" not in merged_page_markdown:
