@@ -904,11 +904,16 @@ def remove_image_placeholders(markdown: str) -> str:
 def dedupe_image_lines_for_markdown(section_markdown: str, lines: list[str]) -> list[str]:
     existing_lines = normalize_text_lines(section_markdown)
     existing_folded = {line.casefold() for line in existing_lines}
+    existing_compact = {compact_ocr_key(line) for line in existing_lines}
     unique_lines: list[str] = []
 
     for line in lines:
         folded = line.casefold()
         if folded in existing_folded:
+            continue
+        compact = compact_ocr_key(line)
+        if is_probable_header_brand_line(line) and compact not in existing_compact:
+            unique_lines.append(line)
             continue
         if any(folded in existing.casefold() or existing.casefold() in folded for existing in existing_lines):
             continue

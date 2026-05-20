@@ -153,6 +153,10 @@ def main() -> int:
             "# Mixed OCR Test\n\n## Page 1\n\nTransaction table here.",
             mixed_pdf_file,
         )
+        merged_brand_heading_markdown = append_image_ocr_sections(
+            "# Rendered Header Test\n\n## Page 1\n\n## Axis Bank Kwik Credit Card Monthly Statement",
+            rendered_header_pdf_file,
+        )
         if "## Page 1" not in mixed_with_ocr:
             failures.append("mixed-text-and-logo.pdf: selective OCR did not produce page-wise markdown")
         elif "PYU*Swiggy FoodBangalore" not in mixed_with_ocr or "Rs 720.00" not in mixed_with_ocr:
@@ -161,6 +165,8 @@ def main() -> int:
             failures.append("mixed-text-and-logo.pdf: selective OCR did not merge image text into the markdown")
         elif "## Page 1\n\nTransaction table here.\n\n### Image OCR" not in merged_page_markdown:
             failures.append("mixed-text-and-logo.pdf: page-level markdown did not keep image OCR inline with the matching page")
+        elif "- AXIS BANK" not in merged_brand_heading_markdown:
+            failures.append("rendered-header-logo.pdf: brand logo OCR was deduped against a longer statement heading")
         else:
             print("[ok] mixed-text-and-logo.pdf keeps base markdown and adds image OCR")
 
