@@ -7,7 +7,7 @@ import pymupdf
 from docling.document_converter import DocumentConverter
 from PIL import Image, ImageDraw, ImageFont
 
-from app import append_image_ocr_sections, convert_pdf_to_markdown
+from app import append_image_ocr_sections, convert_pdf_to_markdown, extract_grouped_text_from_image_blocks
 
 
 def write_sample_pdf(path: Path) -> None:
@@ -66,6 +66,15 @@ def write_mixed_text_and_logo_pdf(path: Path) -> None:
     document.close()
 
 
+def write_rendered_header_logo_pdf(path: Path) -> None:
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((28, 44), "AXIS BANK", fontsize=22)
+    page.insert_text((48, 120), "Rendered header fallback test")
+    document.save(path)
+    document.close()
+
+
 def main() -> int:
     converter = DocumentConverter()
 
@@ -93,6 +102,9 @@ def main() -> int:
         mixed_pdf_file = root / "mixed-text-and-logo.pdf"
         write_mixed_text_and_logo_pdf(mixed_pdf_file)
 
+        rendered_header_pdf_file = root / "rendered-header-logo.pdf"
+        write_rendered_header_logo_pdf(rendered_header_pdf_file)
+
         samples = {
             markdown_file: ["Smoke Test", "Docling should read this markdown file."],
             html_file: ["HTML Smoke Test", "Docling should read this HTML file."],
@@ -117,6 +129,15 @@ def main() -> int:
             failures.append("logo-only.pdf: selective OCR did not extract `ICICI BANK` from the embedded image")
         else:
             print("[ok] logo-only.pdf image OCR")
+
+        rendered_doc = pymupdf.open(rendered_header_pdf_file)
+        rendered_groups = extract_grouped_text_from_image_blocks(rendered_doc[0])
+        rendered_doc.close()
+        rendered_lines = [line for group in rendered_groups for line in group]
+        if "AXIS BANK" not in rendered_lines:
+            failures.append("rendered-header-logo.pdf: selective OCR did not extract `AXIS BANK` from the rendered header")
+        else:
+            print("[ok] rendered-header-logo.pdf header OCR")
 
         mixed_without_ocr, _ = convert_pdf_to_markdown(
             mixed_pdf_file,

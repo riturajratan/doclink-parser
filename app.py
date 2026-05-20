@@ -748,6 +748,95 @@ def normalize_ocr_text_line(text: str) -> str:
     return text
 
 
+def compact_ocr_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.casefold())
+
+
+def ocr_lines_from_page_region(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+    seen: set[str],
+    *,
+    scale: float = 3,
+    min_score: float = 0.45,
+) -> list[str]:
+    ocr = get_ocr_engine()
+    group_lines: list[str] = []
+
+    try:
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=rect, alpha=False)
+        ocr_output = ocr(pixmap.tobytes("png"))
+    except Exception:
+        return group_lines
+
+    texts = getattr(ocr_output, "txts", ()) or ()
+    scores = getattr(ocr_output, "scores", ()) or ()
+    for index, raw_text in enumerate(texts):
+        score = float(scores[index]) if index < len(scores) else 1.0
+        if score < min_score:
+            continue
+        line = normalize_ocr_text_line(str(raw_text))
+        if not is_useful_ocr_line(line):
+            continue
+        folded = compact_ocr_key(line)
+        if not folded or folded in seen:
+            continue
+        seen.add(folded)
+        group_lines.append(line)
+
+    return group_lines
+
+
+def is_probable_header_brand_line(line: str) -> bool:
+    if not is_useful_ocr_line(line) or len(line) > 60 or looks_like_numeric_value(line):
+        return False
+
+    compact = compact_ocr_key(line)
+    if not compact:
+        return False
+
+    brand_tokens = {
+        "axis",
+        "bank",
+        "hdfc",
+        "icici",
+        "yesbank",
+        "sbi",
+        "kotak",
+        "indusind",
+        "idfc",
+        "rbl",
+        "hsbc",
+        "amex",
+        "americanexpress",
+        "standardchartered",
+        "federal",
+        "canara",
+        "baroda",
+        "pnb",
+    }
+    if any(token in compact for token in brand_tokens):
+        return True
+
+    return False
+
+
+def extract_rendered_header_ocr_group(page: pymupdf.Page, seen: set[str]) -> list[str]:
+    header_height = min(90.0, page.rect.height * 0.12)
+    candidate_regions = [
+        pymupdf.Rect(0, 0, page.rect.width * 0.42, header_height),
+        pymupdf.Rect(page.rect.width * 0.58, 0, page.rect.width, header_height),
+    ]
+
+    header_lines: list[str] = []
+    for rect in candidate_regions:
+        for line in ocr_lines_from_page_region(page, rect, seen, scale=4, min_score=0.5):
+            if is_probable_header_brand_line(line):
+                header_lines.append(line)
+
+    return header_lines[:4]
+
+
 def extract_grouped_text_from_image_blocks(page: pymupdf.Page) -> list[list[str]]:
     candidate_rects: list[pymupdf.Rect] = []
     for block in page.get_text("dict").get("blocks", []):
@@ -758,39 +847,18 @@ def extract_grouped_text_from_image_blocks(page: pymupdf.Page) -> list[list[str]
             continue
         candidate_rects.append(pymupdf.Rect(*bbox))
 
-    if not candidate_rects:
-        return []
-
     candidate_rects.sort(key=lambda rect: (rect.y0, -(rect.width * rect.height)))
-    ocr = get_ocr_engine()
     seen: set[str] = set()
     groups: list[list[str]] = []
 
     for rect in candidate_rects[:6]:
-        group_lines: list[str] = []
-        try:
-            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=rect, alpha=False)
-            ocr_output = ocr(pixmap.tobytes("png"))
-        except Exception:
-            continue
-
-        texts = getattr(ocr_output, "txts", ()) or ()
-        scores = getattr(ocr_output, "scores", ()) or ()
-        for index, raw_text in enumerate(texts):
-            score = float(scores[index]) if index < len(scores) else 1.0
-            if score < 0.45:
-                continue
-            line = normalize_ocr_text_line(str(raw_text))
-            if not is_useful_ocr_line(line):
-                continue
-            folded = line.casefold()
-            if folded in seen:
-                continue
-            seen.add(folded)
-            group_lines.append(line)
-
+        group_lines = ocr_lines_from_page_region(page, rect, seen)
         if group_lines:
             groups.append(group_lines)
+
+    header_group = extract_rendered_header_ocr_group(page, seen)
+    if header_group:
+        groups.insert(0, header_group)
 
     return groups
 
@@ -858,7 +926,7 @@ def append_image_ocr_sections(
 ) -> str:
     page_sections = collect_page_image_ocr_groups(pdf_path, page_labels)
     if not page_sections:
-        return markdown
+        return remove_image_placeholders(markdown)
 
     parts = markdown.strip().split("\n\n---\n\n")
     merged_parts: list[str] = []
