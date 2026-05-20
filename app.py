@@ -39,6 +39,7 @@ CONVERTER: Any | None = None
 OCR_ENGINE: Any | None = None
 CONVERTER_LOCK = threading.Lock()
 OCR_ENGINE_LOCK = threading.Lock()
+STARTUP_READY = threading.Event()
 SUPPORTED_UPLOAD_EXTENSIONS = {
     ".pdf",
     ".docx",
@@ -2449,6 +2450,8 @@ def warmup_runtime_background() -> None:
         warmup_runtime()
     except Exception as exc:
         print(f"Docling runtime warmup failed: {exc}")
+    finally:
+        STARTUP_READY.set()
 
 
 class PdfMarkdownHandler(BaseHTTPRequestHandler):
@@ -2460,6 +2463,9 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/healthz":
+            if not STARTUP_READY.is_set():
+                self.respond_text("warming\n", HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             self.respond_text("ok\n")
             return
 
@@ -2694,6 +2700,8 @@ class PdfMarkdownHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     configure_temp_directory()
+    if not PREWARM_ON_STARTUP:
+        STARTUP_READY.set()
     server = ThreadingHTTPServer((HOST, PORT), PdfMarkdownHandler)
     print(f"Serving PDF to Markdown app on http://{HOST}:{PORT}")
     if PREWARM_ON_STARTUP:

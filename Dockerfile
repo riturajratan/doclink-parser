@@ -29,6 +29,8 @@ RUN pip install --upgrade pip \
 COPY . .
 RUN python3 warmup_models.py
 
+ENV PREWARM_ON_STARTUP=1
+
 EXPOSE 8010
 
 CMD ["python3", "app.py"]
